@@ -2200,6 +2200,16 @@ class Orchestrator:
         self._pending_system_alerts = alerts
         return alerts
 
+    def _has_pending_urgent_trigger(self) -> bool:
+        pending = getattr(self, "_pending_triggers", None)
+        if not pending:
+            return False
+        urgent_types = {TriggerType.SIGNAL, TriggerType.NEED, TriggerType.THREAT}
+        for trig in pending:
+            if getattr(trig, "type", None) in urgent_types:
+                return True
+        return False
+
     # --- Cycle principal ----------------------------------------------------
     def run_once_cycle(self, user_msg: Optional[str] = None) -> List[Dict[str, Any]]:
         try:
@@ -2210,8 +2220,20 @@ class Orchestrator:
             pass
 
         jm = getattr(self, "job_manager", None)
-        if not (jm and jm.has_urgent()):
-            self.scheduler.tick()
+        preemptive_urgent = False
+        if jm:
+            if user_msg:
+                preemptive_urgent = True
+            elif self._has_pending_urgent_trigger():
+                preemptive_urgent = True
+        if preemptive_urgent:
+            jm.enter_urgent_context()
+        try:
+            if not (jm and jm.has_urgent()):
+                self.scheduler.tick()
+        finally:
+            if preemptive_urgent:
+                jm.exit_urgent_context()
         self.job_manager.drain_to_memory(self._memory_store)
 
         try:

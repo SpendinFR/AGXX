@@ -358,6 +358,14 @@ class CognitiveArchitecture:
         except Exception:
             data_dir = "data"
         self.jobs = JobManager(self, data_dir=data_dir)
+        try:
+            self.telemetry.bind_job_manager(self.jobs)
+        except Exception:
+            pass
+        try:
+            self.goals.bind_job_manager(self.jobs)
+        except Exception:
+            pass
 
         skill_storage = os.path.join(data_dir, "skills")
         self.skill_sandbox = SkillSandboxManager(

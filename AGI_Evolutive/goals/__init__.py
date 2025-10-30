@@ -88,6 +88,7 @@ class GoalSystem:
             persist_path=persist_path,
             dashboard_path=dashboard_path,
         )
+        self._job_manager = None
         self.metadata: Dict[str, GoalMetadata] = {}
         self.pending_actions: Deque[Dict[str, Any]] = deque()
         self.curiosity = CuriosityEngine(architecture=architecture)
@@ -107,6 +108,13 @@ class GoalSystem:
         self._hydrate_metadata()
         self._ensure_structural_hierarchy()
         self._question_blocked = False
+
+    def bind_job_manager(self, job_manager) -> None:
+        self._job_manager = job_manager
+        try:
+            self.store.bind_job_manager(job_manager)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Public API

@@ -2200,6 +2200,16 @@ class Orchestrator:
         self._pending_system_alerts = alerts
         return alerts
 
+    def _has_pending_urgent_trigger(self) -> bool:
+        pending = getattr(self, "_pending_triggers", None)
+        if not pending:
+            return False
+        urgent_types = {TriggerType.SIGNAL, TriggerType.NEED, TriggerType.THREAT}
+        for trig in pending:
+            if getattr(trig, "type", None) in urgent_types:
+                return True
+        return False
+
     # --- Cycle principal ----------------------------------------------------
     def run_once_cycle(self, user_msg: Optional[str] = None) -> List[Dict[str, Any]]:
         try:
@@ -2209,7 +2219,21 @@ class Orchestrator:
         except Exception:
             pass
 
-        self.scheduler.tick()
+        jm = getattr(self, "job_manager", None)
+        preemptive_urgent = False
+        if jm:
+            if user_msg:
+                preemptive_urgent = True
+            elif self._has_pending_urgent_trigger():
+                preemptive_urgent = True
+        if preemptive_urgent:
+            jm.enter_urgent_context()
+        try:
+            if not (jm and jm.has_urgent()):
+                self.scheduler.tick()
+        finally:
+            if preemptive_urgent:
+                jm.exit_urgent_context()
         self.job_manager.drain_to_memory(self._memory_store)
 
         try:
@@ -2623,6 +2647,20 @@ class Orchestrator:
         return result
 
     def _run_pipeline(self, trigger: Trigger) -> Dict[str, Any]:
+        jm = getattr(self, "job_manager", None)
+        urgent_context = bool(
+            jm
+            and trigger.type in {TriggerType.SIGNAL, TriggerType.NEED, TriggerType.THREAT}
+        )
+        if urgent_context:
+            jm.enter_urgent_context()
+        try:
+            return self._run_pipeline_impl(trigger)
+        finally:
+            if urgent_context:
+                jm.exit_urgent_context()
+
+    def _run_pipeline_impl(self, trigger: Trigger) -> Dict[str, Any]:
         if self.immediate_question_blocked:
             meta = trigger.meta or {}
             try:

@@ -2,9 +2,13 @@
 # idempotence, progrès, persistance JSONL, drain des complétions côté thread principal).
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, List, Deque, Tuple
+from typing import Any, Callable, Dict, Optional, List, Deque, Tuple, Type
 from contextlib import contextmanager, nullcontext
 import time, threading, heapq, os, json, uuid, traceback, collections, math, random, logging
+try:  # pragma: no cover - defensive import guard
+    import ctypes
+except Exception:  # pragma: no cover - platform fallback
+    ctypes = None
 
 from AGI_Evolutive.utils.llm_service import bind_job_manager, try_call_llm_dict
 
@@ -14,6 +18,10 @@ LOGGER = logging.getLogger(__name__)
 
 def _now() -> float:
     return time.time()
+
+
+class JobPreempted(Exception):
+    """Exception injected in worker threads to preempt non-urgent jobs."""
 
 
 @dataclass(order=True)
@@ -184,6 +192,7 @@ class JobManager:
         self._urgent_thread_counts: Dict[int, int] = {}
         self._urgent_local = threading.local()
         self._pause_cond = threading.Condition(self._lock)
+        self._thread_jobs: Dict[int, str] = {}
 
         # Démarre les workers
         self._alive = True
@@ -467,6 +476,32 @@ class JobManager:
                     self._pause_cond.wait()
         return True
 
+    def preempt_nonurgent(self) -> int:
+        """Force running non-urgent jobs to stop and get re-queued."""
+
+        if ctypes is None:
+            return 0
+        current_ident = threading.get_ident()
+        with self._lock:
+            targets: List[Tuple[int, Optional[Job]]] = [
+                (ident, self._jobs.get(job_id))
+                for ident, job_id in self._thread_jobs.items()
+                if ident != current_ident
+            ]
+        preempted = 0
+        cancelled: List[str] = []
+        for ident, job in targets:
+            if ident is None:
+                continue
+            if not job or job.urgent:
+                continue
+            if self._raise_async_exception(ident, JobPreempted):
+                preempted += 1
+                cancelled.append(job.id)
+        if preempted:
+            self._log({"event": "preempt_request", "count": preempted, "jobs": cancelled})
+        return preempted
+
     @contextmanager
     def urgent_section(self):
         self.enter_urgent_context()
@@ -619,6 +654,7 @@ class JobManager:
                 self._running_inter += 1
             else:
                 self._running_back += 1
+            self._thread_jobs[threading.get_ident()] = j.id
         self._log({"event": "start", "job": self._job_view(j)})
 
     def _finish_job(self, j: Job, ok: bool, result: Any = None, error: Optional[str] = None, trace: Optional[str] = None):
@@ -679,6 +715,45 @@ class JobManager:
         with self._lock:
             return job_id in self._cancelled
 
+    def _handle_preempt(self, j: Job) -> None:
+        with self._lock:
+            if j.urgent:
+                self._running_urgent = max(0, self._running_urgent - 1)
+            if j.queue == "interactive":
+                self._running_inter = max(0, self._running_inter - 1)
+            else:
+                self._running_back = max(0, self._running_back - 1)
+            j.status = "queued"
+            j.started_ts = 0.0
+            j.finished_ts = 0.0
+            j.created_ts = _now()
+            j.result = None
+            j.error = None
+            j.trace = None
+            j.metrics.pop("latency_s", None)
+            self._push_pq(j)
+            self._pause_cond.notify_all()
+        self._log({"event": "preempted", "job": self._job_view(j)})
+
+    def _raise_async_exception(self, thread_id: int, exc_type: Type[BaseException]) -> bool:
+        if ctypes is None or thread_id is None:
+            return False
+        try:
+            result = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_long(thread_id), ctypes.py_object(exc_type)
+            )
+        except Exception:
+            return False
+        if result == 0:
+            return False
+        if result > 1:
+            try:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread_id), None)
+            except Exception:
+                pass
+            return False
+        return True
+
     def _worker_loop(self, lane: str):
         while self._alive:
             jid = self._pop_next(lane)
@@ -697,17 +772,28 @@ class JobManager:
             ctx = JobContext(self, j.id)
             ok, result, err, tr = True, None, None, None
             runner_context = self.urgent_section() if j.urgent else nullcontext()
+            thread_ident = threading.get_ident()
+            preempted = False
             try:
                 with runner_context:
                     # timeout soft: on laisse la fonction vérifier ctx.cancelled() périodiquement
                     result = j.fn(ctx, j.args or {})
+            except JobPreempted:
+                preempted = True
+                self._handle_preempt(j)
             except Exception as e:
                 ok, err = False, str(e)
                 tr = traceback.format_exc()
+            if preempted:
+                with self._lock:
+                    self._thread_jobs.pop(thread_ident, None)
+                continue
             # cancellation après exécution ?
             if self._is_cancelled(j.id) and ok:
                 ok, err = False, "cancelled"
             self._finish_job(j, ok=ok, result=result, error=err, trace=tr)
+            with self._lock:
+                self._thread_jobs.pop(thread_ident, None)
 
     def _job_view(self, j: Optional[Job]) -> Optional[Dict[str, Any]]:
         if not j:

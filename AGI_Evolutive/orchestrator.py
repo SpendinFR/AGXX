@@ -2234,6 +2234,10 @@ class Orchestrator:
         )
         if urgent_context:
             with jm.urgent_section():
+                try:
+                    jm.preempt_nonurgent()
+                except Exception:
+                    logger.exception("Échec lors de la préemption des jobs non urgents")
                 return self._run_once_cycle_impl(user_msg=user_msg)
         return self._run_once_cycle_impl(user_msg=user_msg)
 

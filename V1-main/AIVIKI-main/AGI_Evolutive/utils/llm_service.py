@@ -172,8 +172,22 @@ class LLMIntegrationManager:
             raise LLMIntegrationError(f"LLM call failed for spec '{spec_key}': {exc}") from exc
 
         latency = time.perf_counter() - start
+        thread = threading.current_thread()
+        thread_ident = getattr(thread, "ident", None)
+        latency_fmt = f"{latency:.2f}"
         LOG.info(
-            "LLM call completed", extra={"spec": spec_key, "latency_s": latency}
+            "LLM spec '%s' terminée avec succès en %ss (appel %ss) – thread %s#%s",
+            spec_key,
+            latency_fmt,
+            latency_fmt,
+            thread.name,
+            thread_ident if thread_ident is not None else "?",
+            extra={
+                "spec": spec_key,
+                "latency_s": latency,
+                "thread_name": thread.name,
+                "thread_ident": thread_ident,
+            },
         )
         return LLMInvocation(spec=spec, result=result)
 

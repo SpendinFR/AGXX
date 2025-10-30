@@ -151,6 +151,7 @@ class DagStore:
         os.makedirs(os.path.dirname(self.persist_path), exist_ok=True)
         self.nodes: Dict[str, GoalNode] = {}
         self.active_goal_id: Optional[str] = None
+        self.job_manager = None
         self.priority_model = OnlinePriorityModel(
             feature_names=[
                 "value",
@@ -170,6 +171,9 @@ class DagStore:
         )
         self._load()
 
+    def bind_job_manager(self, job_manager) -> None:
+        self.job_manager = job_manager
+
     # ------------------------------------------------------------------
     def _llm_review_priority(
         self,
@@ -178,6 +182,13 @@ class DagStore:
         adaptive_score: float,
         fallback_priority: float,
     ) -> Optional[Dict[str, Any]]:
+        jm = getattr(self, "job_manager", None)
+        if jm is not None:
+            try:
+                if jm.has_urgent() or jm.has_urgent_context():
+                    return None
+            except Exception:
+                pass
         goal_snapshot = {
             "id": node.id,
             "description": node.description,

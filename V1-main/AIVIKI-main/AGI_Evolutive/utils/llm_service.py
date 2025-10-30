@@ -1,6 +1,8 @@
 """Service layer to orchestrate repository-wide LLM integrations."""
 from __future__ import annotations
 
+import json
+import logging
 import os
 import threading
 import time
@@ -12,6 +14,23 @@ from itertools import islice
 
 from .llm_client import LLMCallError, LLMResult, OllamaLLMClient, OllamaModelConfig
 from .llm_specs import LLMIntegrationSpec, get_spec
+
+
+LOG = logging.getLogger(__name__)
+
+
+def _summarize_for_log(data: Any, *, limit: int = 400) -> str:
+    if isinstance(data, str):
+        serialized = data
+    else:
+        try:
+            serialized = json.dumps(data, ensure_ascii=False, default=str)
+        except Exception:
+            serialized = repr(data)
+    serialized = serialized.replace("\n", " ")
+    if len(serialized) > limit:
+        return serialized[:limit] + "…"
+    return serialized
 
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
@@ -68,13 +87,15 @@ _ACTIVITY_LOG: deque[LLMCallRecord] = deque(maxlen=200)
 
 def _record_activity(spec_key: str, status: str, message: Optional[str] = None) -> None:
     try:
-        _ACTIVITY_LOG.appendleft(
-            LLMCallRecord(
-                spec_key=spec_key,
-                status=status,
-                timestamp=time.time(),
-                message=message.strip() if isinstance(message, str) else message,
-            )
+        record = LLMCallRecord(
+            spec_key=spec_key,
+            status=status,
+            timestamp=time.time(),
+            message=message.strip() if isinstance(message, str) else message,
+        )
+        _ACTIVITY_LOG.appendleft(record)
+        LOG.debug(
+            "LLM activity recorded", extra={"spec": spec_key, "status": status, "message": message}
         )
     except Exception:  # pragma: no cover - defensive guard for diagnostics
         pass
@@ -108,7 +129,11 @@ class LLMIntegrationManager:
         return self._enabled
 
     def set_enabled(self, value: bool) -> None:
+        previous = self._enabled
         self._enabled = bool(value)
+        LOG.info(
+            "LLM manager availability changed", extra={"previous": previous, "current": self._enabled}
+        )
 
     def call_json(
         self,
@@ -121,12 +146,16 @@ class LLMIntegrationManager:
         if not self._enabled:
             raise LLMUnavailableError("LLM integration is disabled")
 
+        LOG.debug(
+            "LLM JSON call", extra={"spec": spec_key, "payload": _summarize_for_log(input_payload)}
+        )
         spec = get_spec(spec_key)
         instructions: list[str] = list(spec.extra_instructions)
         if extra_instructions:
             instructions.extend(instr.strip() for instr in extra_instructions if instr and instr.strip())
         instructions.append("Si tu n'es pas certain, explique l'incertitude dans le champ 'notes'.")
 
+        start = time.perf_counter()
         try:
             result = self._client.generate_json(
                 self._resolve_model(spec.preferred_model),
@@ -137,8 +166,15 @@ class LLMIntegrationManager:
                 max_retries=max_retries,
             )
         except LLMCallError as exc:  # pragma: no cover - delegated to integration error
+            LOG.error(
+                "LLM call error", extra={"spec": spec_key, "error": str(exc)}, exc_info=True
+            )
             raise LLMIntegrationError(f"LLM call failed for spec '{spec_key}': {exc}") from exc
 
+        latency = time.perf_counter() - start
+        LOG.info(
+            "LLM call completed", extra={"spec": spec_key, "latency_s": latency}
+        )
         return LLMInvocation(spec=spec, result=result)
 
     def call_dict(
@@ -160,6 +196,9 @@ class LLMIntegrationManager:
             raise LLMIntegrationError(
                 f"Spec '{spec_key}' returned a non-mapping payload: {type(parsed).__name__}"
             )
+        LOG.debug(
+            "LLM response parsed", extra={"spec": spec_key, "response": _summarize_for_log(parsed)}
+        )
         return parsed
 
     def _resolve_model(self, model_name: str) -> OllamaModelConfig:
@@ -177,6 +216,7 @@ def get_llm_manager() -> LLMIntegrationManager:
     global _default_manager
     with _default_lock:
         if _default_manager is None:
+            LOG.debug("Instantiating default LLM manager")
             _default_manager = LLMIntegrationManager()
         return _default_manager
 
@@ -185,6 +225,10 @@ def set_llm_manager(manager: Optional[LLMIntegrationManager]) -> None:
     global _default_manager
     with _default_lock:
         _default_manager = manager
+        LOG.info(
+            "Default LLM manager updated",
+            extra={"manager": manager.__class__.__name__ if manager else None},
+        )
 
 
 def is_llm_enabled() -> bool:
@@ -212,11 +256,16 @@ def try_call_llm_dict(
     """
 
     if not is_llm_enabled():
+        LOG.debug("LLM integration disabled", extra={"spec": spec_key})
         _record_activity(spec_key, "disabled", "LLM integration désactivée")
         return None
 
     try:
         manager = get_llm_manager()
+        LOG.debug(
+            "Calling LLM via helper",
+            extra={"spec": spec_key, "payload": _summarize_for_log(input_payload)},
+        )
         payload = manager.call_dict(
             spec_key,
             input_payload=input_payload,
@@ -224,9 +273,17 @@ def try_call_llm_dict(
             max_retries=max_retries,
         )
         _record_activity(spec_key, "success", None)
+        LOG.debug(
+            "LLM helper success", extra={"spec": spec_key, "response": _summarize_for_log(payload)}
+        )
         return payload
     except (LLMUnavailableError, LLMIntegrationError) as exc:
         _record_activity(spec_key, "error", str(exc))
+        LOG.warning(
+            "LLM helper reported integration error",
+            extra={"spec": spec_key, "error": str(exc)},
+            exc_info=True,
+        )
         if logger is not None:
             try:
                 logger.debug(
@@ -237,6 +294,11 @@ def try_call_llm_dict(
         return None
     except Exception as exc:  # pragma: no cover - unexpected failure safety net
         _record_activity(spec_key, "error", str(exc))
+        LOG.error(
+            "Unexpected LLM helper failure",
+            extra={"spec": spec_key, "error": str(exc)},
+            exc_info=True,
+        )
         if logger is not None:
             try:
                 logger.warning(

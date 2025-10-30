@@ -379,6 +379,11 @@ def try_call_llm_dict(
             )
         except Exception:  # pragma: no cover - defensive logging guard
             pass
+        if wait_after_call and job_manager is not None and not thread_is_urgent:
+            try:
+                job_manager.wait_for_urgent_clear(timeout=60.0)
+            except Exception:
+                pass
         return payload
     except (LLMUnavailableError, LLMIntegrationError) as exc:
         total_elapsed = time.perf_counter() - total_start

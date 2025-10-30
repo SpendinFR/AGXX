@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import os
 import time
@@ -165,6 +166,12 @@ class Autopilot:
         """Run a full autopilot iteration."""
 
         start_ts = time.time()
+        self._log(
+            "info",
+            "Autopilot step #%d starting (user_msg=%s)",
+            self._step_counter + 1,
+            self._summarize_payload(user_msg) if user_msg is not None else "<none>",
+        )
         since_last = None if not self._last_step_ts else start_ts - self._last_step_ts
         throttled = bool(
             since_last is not None and since_last < max(self.min_step_interval, 0.0)
@@ -252,6 +259,13 @@ class Autopilot:
         self._diagnostics_history.append(metrics)
         self._last_cycle_metrics = metrics
         self._step_counter += 1
+
+        self._log(
+            "debug",
+            "Autopilot step #%d metrics: %s",
+            self._step_counter,
+            self._summarize_payload(metrics),
+        )
 
         if not cycle_result.ok:
             raise StageExecutionError("cycle", cycle_result)
@@ -416,6 +430,22 @@ class Autopilot:
             self._log("exception", "Manual persistence checkpoint failed", exc_info=exc)
             return False
 
+    def _summarize_payload(self, payload: Any, *, limit: int = 400) -> str:
+        if isinstance(payload, str):
+            serialised = payload
+        else:
+            try:
+                serialised = json.dumps(json_sanitize(payload), ensure_ascii=False)
+            except Exception:
+                try:
+                    serialised = repr(payload)
+                except Exception:
+                    serialised = "<unrepresentable>"
+        serialised = serialised.replace("\n", " ")
+        if len(serialised) > limit:
+            return serialised[:limit] + "…"
+        return serialised
+
     # ------------------------------------------------------------------
     # Diagnostics helpers
     def _run_stage(
@@ -446,6 +476,13 @@ class Autopilot:
 
         call_args = tuple(args or [])
         call_kwargs = dict(kwargs or {})
+        self._log(
+            "debug",
+            "Stage %s starting with args=%s kwargs=%s",
+            name,
+            self._summarize_payload(call_args),
+            self._summarize_payload(call_kwargs),
+        )
         started = time.perf_counter()
         try:
             payload = func(*call_args, **call_kwargs)
@@ -458,6 +495,13 @@ class Autopilot:
                     state.failures,
                 )
             state.reset()
+            self._log(
+                "info",
+                "Stage %s completed in %.3fs (payload=%s)",
+                name,
+                duration,
+                self._summarize_payload(payload),
+            )
             return StageResult(
                 name=name,
                 ok=True,
@@ -479,9 +523,10 @@ class Autopilot:
                 cooldown_until = state.cooldown_until
             self._log(
                 "exception",
-                "Stage %s failed (%d consecutive)",
+                "Stage %s failed (%d consecutive) after %.3fs",
                 name,
                 state.failures,
+                duration,
                 exc_info=exc,
             )
             details = {"cooldown_until": cooldown_until} if cooldown_until else None
@@ -519,9 +564,25 @@ class Autopilot:
             has_cycle_metrics = True
             accepts_kwargs = True
 
+        self._log(
+            "debug",
+            "Invoking orchestrator run_once_cycle (has_cycle_metrics=%s, kwargs=%s)",
+            has_cycle_metrics,
+            self._summarize_payload({"user_msg": user_msg}),
+        )
+        started = time.perf_counter()
         if has_cycle_metrics or accepts_kwargs:
-            return runner(user_msg=user_msg, cycle_metrics=cycle_metrics)
-        return runner(user_msg=user_msg)
+            result = runner(user_msg=user_msg, cycle_metrics=cycle_metrics)
+        else:
+            result = runner(user_msg=user_msg)
+        duration = time.perf_counter() - started
+        self._log(
+            "info",
+            "Orchestrator run_once_cycle completed in %.3fs (result=%s)",
+            duration,
+            self._summarize_payload(result),
+        )
+        return result
 
     def _extract_persistence_drift(self) -> Optional[Dict[str, Any]]:
         drift_accessor = getattr(self.persist, "get_last_drift", None)

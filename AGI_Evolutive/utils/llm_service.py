@@ -238,25 +238,23 @@ def try_call_llm_dict(
     thread_identifier = f"{thread_name}#{thread.ident}" if thread.ident is not None else thread_name
 
     job_manager = _get_bound_job_manager()
+    wait_after_call = False
     if job_manager is not None:
         try:
             thread_is_urgent = bool(job_manager.current_thread_is_urgent())
         except Exception:
             thread_is_urgent = False
         if not thread_is_urgent:
-            wait_start = time.perf_counter()
+            wait_after_call = True
+            wait_deadline = time.perf_counter() + 60.0
             notified = False
             while True:
                 try:
-                    if not bool(job_manager.has_urgent()):
-                        break
+                    cleared = job_manager.wait_for_urgent_clear(timeout=0.1)
                 except Exception:
                     break
-                try:
-                    if bool(job_manager.current_thread_is_urgent()):
-                        break
-                except Exception:
-                    pass
+                if cleared:
+                    break
                 if not notified:
                     try:
                         log.debug(
@@ -267,9 +265,8 @@ def try_call_llm_dict(
                     except Exception:
                         pass
                     notified = True
-                if time.perf_counter() - wait_start > 60.0:
+                if time.perf_counter() >= wait_deadline:
                     break
-                time.sleep(0.05)
 
     if not is_llm_enabled():
         _record_activity(spec_key, "disabled", "LLM integration désactivée")
@@ -306,6 +303,11 @@ def try_call_llm_dict(
             )
         except Exception:  # pragma: no cover - defensive logging guard
             pass
+        if wait_after_call and job_manager is not None and not thread_is_urgent:
+            try:
+                job_manager.wait_for_urgent_clear(timeout=60.0)
+            except Exception:
+                pass
         return payload
     except (LLMUnavailableError, LLMIntegrationError) as exc:
         total_elapsed = time.perf_counter() - total_start

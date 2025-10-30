@@ -414,8 +414,7 @@ class JobManager:
         with self._lock:
             self._urgent_context += 1
             if self._urgent_context == 1 and prior_depth == 0:
-                while self._nonurgent_running_locked() > 0:
-                    self._pause_cond.wait(timeout=0.1)
+                self._pause_cond.notify_all()
 
     def exit_urgent_context(self) -> None:
         self._unmark_thread_urgent()
@@ -437,16 +436,36 @@ class JobManager:
 
     def has_urgent(self) -> bool:
         with self._lock:
-            return (
-                self._urgent_context > 0
-                or self._running_urgent > 0
-                or bool(self._pq_urgent)
-            )
+            return self._urgent_active_locked()
 
     def _nonurgent_running_locked(self) -> int:
         inter_nonurgent = max(0, self._running_inter - self._running_urgent)
         back = max(0, self._running_back)
         return inter_nonurgent + back
+
+    def _urgent_active_locked(self) -> bool:
+        return (
+            self._urgent_context > 0
+            or self._running_urgent > 0
+            or bool(self._pq_urgent)
+        )
+
+    def wait_for_urgent_clear(self, timeout: Optional[float] = None) -> bool:
+        """Block until the urgent lane is idle or the timeout expires."""
+
+        deadline = None
+        if timeout is not None:
+            deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._lock:
+            while self._urgent_active_locked():
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._pause_cond.wait(timeout=remaining)
+                else:
+                    self._pause_cond.wait()
+        return True
 
     @contextmanager
     def urgent_section(self):

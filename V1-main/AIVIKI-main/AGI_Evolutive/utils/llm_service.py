@@ -143,6 +143,9 @@ class LLMIntegrationManager:
         if not self._enabled:
             raise LLMUnavailableError("LLM integration is disabled")
 
+        LOG.debug(
+            "LLM JSON call", extra={"spec": spec_key, "payload": _summarize_for_log(input_payload)}
+        )
         spec = get_spec(spec_key)
         instructions: list[str] = list(spec.extra_instructions)
         if extra_instructions:
@@ -204,6 +207,9 @@ class LLMIntegrationManager:
             raise LLMIntegrationError(
                 f"Spec '{spec_key}' returned a non-mapping payload: {type(parsed).__name__}"
             )
+        LOG.debug(
+            "LLM response parsed", extra={"spec": spec_key, "response": _summarize_for_log(parsed)}
+        )
         return parsed
 
     def _resolve_model(self, model_name: str) -> OllamaModelConfig:
@@ -221,6 +227,7 @@ def get_llm_manager() -> LLMIntegrationManager:
     global _default_manager
     with _default_lock:
         if _default_manager is None:
+            LOG.debug("Instantiating default LLM manager")
             _default_manager = LLMIntegrationManager()
         return _default_manager
 
@@ -260,11 +267,16 @@ def try_call_llm_dict(
     """
 
     if not is_llm_enabled():
+        LOG.debug("LLM integration disabled", extra={"spec": spec_key})
         _record_activity(spec_key, "disabled", "LLM integration désactivée")
         return None
 
     try:
         manager = get_llm_manager()
+        LOG.debug(
+            "Calling LLM via helper",
+            extra={"spec": spec_key, "payload": _summarize_for_log(input_payload)},
+        )
         payload = manager.call_dict(
             spec_key,
             input_payload=input_payload,
@@ -272,6 +284,9 @@ def try_call_llm_dict(
             max_retries=max_retries,
         )
         _record_activity(spec_key, "success", None)
+        LOG.debug(
+            "LLM helper success", extra={"spec": spec_key, "response": _summarize_for_log(payload)}
+        )
         return payload
     except (LLMUnavailableError, LLMIntegrationError) as exc:
         _record_activity(spec_key, "error", str(exc))

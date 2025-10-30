@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import random
@@ -70,6 +71,7 @@ from AGI_Evolutive.phenomenology import (
     PhenomenalRecall,
 )
 from AGI_Evolutive.runtime.system_monitor import SystemMonitor
+from AGI_Evolutive.utils.jsonsafe import json_sanitize
 from AGI_Evolutive.utils.llm_service import (
     LLMIntegrationError,
     LLMUnavailableError,
@@ -80,6 +82,23 @@ from AGI_Evolutive.utils.llm_service import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _summarize_for_log(payload: Any, *, limit: int = 400) -> str:
+    if isinstance(payload, str):
+        serialised = payload
+    else:
+        try:
+            serialised = json.dumps(json_sanitize(payload), ensure_ascii=False)
+        except Exception:
+            try:
+                serialised = repr(payload)
+            except Exception:
+                serialised = "<unrepresentable>"
+    serialised = serialised.replace("\n", " ")
+    if len(serialised) > limit:
+        return serialised[:limit] + "…"
+    return serialised
 
 
 def _llm_enabled() -> bool:
@@ -1971,6 +1990,8 @@ class Orchestrator:
 
     # --- Legacy helper cycles (kept for compatibility) ---------------------
     def observe(self, user_msg: Optional[str] = None):
+        if user_msg is not None:
+            logger.debug("Observation utilisateur: %s", _summarize_for_log(user_msg))
         if user_msg:
             self.io.perception.ingest_user_message(user_msg, author="user")
         else:
@@ -2202,6 +2223,12 @@ class Orchestrator:
 
     # --- Cycle principal ----------------------------------------------------
     def run_once_cycle(self, user_msg: Optional[str] = None) -> List[Dict[str, Any]]:
+        logger.info(
+            "Cycle orchestrateur démarré (message_utilisateur=%s)",
+            "oui" if user_msg else "non",
+        )
+        if user_msg:
+            logger.debug("Message utilisateur reçu: %s", _summarize_for_log(user_msg))
         try:
             prioritizer = getattr(self.arch, "prioritizer", None)
             if prioritizer is not None:
@@ -2238,6 +2265,7 @@ class Orchestrator:
             resource_monitor = None
         system_alerts = self._update_physiology_from_system(resource_monitor)
         scored = self.trigger_bus.collect_and_score(valence=valence)
+        logger.debug("Déclencheurs scorés: %d", len(scored))
         self._collect_kernel_alerts_from_triggers(scored)
         selected: List[Any] = []
         for st in scored:
@@ -2250,6 +2278,7 @@ class Orchestrator:
                 break
         if not selected:
             selected = scored[:3]
+        logger.debug("Déclencheurs sélectionnés: %d", len(selected))
 
         urgent = any(
             item.trigger.type is TriggerType.THREAT and item.trigger.meta.get("immediacy", 0.0) >= 0.7
@@ -2287,6 +2316,10 @@ class Orchestrator:
         if self._last_system_snapshot:
             self.phenomenal_kernel_state["system_snapshot"] = dict(self._last_system_snapshot)
         setattr(self.arch, "phenomenal_kernel_state", self.phenomenal_kernel_state)
+        logger.debug(
+            "État du noyau phénoménal mis à jour: %s",
+            _summarize_for_log(self.phenomenal_kernel_state),
+        )
         previous_mode = getattr(self, "current_mode", "travail")
         mode_info = self._mode_manager.update(self.phenomenal_kernel_state, urgent=urgent)
         self.current_mode = mode_info.get("mode", previous_mode)
@@ -2478,6 +2511,13 @@ class Orchestrator:
                 apply_preferences_if_confident(self, threshold=0.75)
             except Exception:
                 pass
+
+        logger.info(
+            "Cycle orchestrateur terminé (contextes=%d)",
+            len(contexts),
+        )
+        if contexts:
+            logger.debug("Contextes générés: %s", _summarize_for_log(contexts))
 
         return contexts
 

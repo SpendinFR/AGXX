@@ -292,8 +292,20 @@ def try_call_llm_dict(
         )
         call_elapsed = time.perf_counter() - call_start
         total_elapsed = time.perf_counter() - total_start
+        waited_for_clear = False
+        if wait_after_call and job_manager is not None and not thread_is_urgent:
+            try:
+                waited_for_clear = job_manager.wait_for_urgent_clear(timeout=60.0)
+            except Exception:
+                waited_for_clear = False
         _record_activity(spec_key, "success", None)
         try:
+            if waited_for_clear:
+                log.debug(
+                    "LLM spec '%s' reprise après fenêtre urgente – thread %s",
+                    spec_key,
+                    thread_identifier,
+                )
             log.info(
                 "LLM spec '%s' terminée avec succès en %.2fs (appel %.2fs) – thread %s",
                 spec_key,

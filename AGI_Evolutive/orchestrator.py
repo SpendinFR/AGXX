@@ -2229,6 +2229,16 @@ class Orchestrator:
     # --- Cycle principal ----------------------------------------------------
     def run_once_cycle(self, user_msg: Optional[str] = None) -> List[Dict[str, Any]]:
         jm = getattr(self, "job_manager", None)
+        urgent_context = bool(
+            jm and (user_msg is not None or self._has_pending_urgent_trigger())
+        )
+        if urgent_context:
+            with jm.urgent_section():
+                return self._run_once_cycle_impl(user_msg=user_msg)
+        return self._run_once_cycle_impl(user_msg=user_msg)
+
+    def _run_once_cycle_impl(self, *, user_msg: Optional[str] = None) -> List[Dict[str, Any]]:
+        jm = getattr(self, "job_manager", None)
 
         skip_reprioritize = False
         if user_msg:
@@ -2246,21 +2256,10 @@ class Orchestrator:
             except Exception:
                 pass
 
-        preemptive_urgent = False
-        if jm:
-            if user_msg:
-                preemptive_urgent = True
-            elif self._has_pending_urgent_trigger():
-                preemptive_urgent = True
-        if preemptive_urgent:
-            jm.enter_urgent_context()
-        try:
-            if not (jm and jm.has_urgent()):
-                self.scheduler.tick()
-        finally:
-            if preemptive_urgent:
-                jm.exit_urgent_context()
-        self.job_manager.drain_to_memory(self._memory_store)
+        if not (jm and jm.has_urgent()):
+            self.scheduler.tick()
+        if jm is not None:
+            jm.drain_to_memory(self._memory_store)
 
         try:
             self._sj_conf_cache = self._sj_config_model.current_config()

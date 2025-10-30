@@ -484,6 +484,7 @@ def run_cli(*, disable_llm: bool = False):
                 pass
 
             msg = input("\n> ").strip()
+            logger.debug("Entrée CLI reçue: %s", msg)
         except (EOFError, KeyboardInterrupt):
             print("\n⏳ Sauvegarde avant sortie…")
             try:

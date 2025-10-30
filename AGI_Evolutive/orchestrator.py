@@ -1108,6 +1108,22 @@ class Orchestrator:
             job_manager = existing_jobs
 
         self.job_manager = job_manager
+        try:
+            self.telemetry.bind_job_manager(job_manager)
+        except Exception:
+            pass
+        arch_tm = getattr(self.arch, "telemetry", None)
+        if arch_tm is not None and hasattr(arch_tm, "bind_job_manager"):
+            try:
+                arch_tm.bind_job_manager(job_manager)
+            except Exception:
+                pass
+        arch_goals = getattr(self.arch, "goals", None)
+        if arch_goals is not None and hasattr(arch_goals, "bind_job_manager"):
+            try:
+                arch_goals.bind_job_manager(job_manager)
+            except Exception:
+                pass
         self._phenomenal_kernel = PhenomenalKernel()
         self.phenomenal_journal = getattr(self, "phenomenal_journal", None) or PhenomenalJournal()
         self.phenomenal_recall = getattr(self, "phenomenal_recall", None) or PhenomenalRecall(
@@ -2200,16 +2216,50 @@ class Orchestrator:
         self._pending_system_alerts = alerts
         return alerts
 
+    def _has_pending_urgent_trigger(self) -> bool:
+        pending = getattr(self, "_pending_triggers", None)
+        if not pending:
+            return False
+        urgent_types = {TriggerType.SIGNAL, TriggerType.NEED, TriggerType.THREAT}
+        for trig in pending:
+            if getattr(trig, "type", None) in urgent_types:
+                return True
+        return False
+
     # --- Cycle principal ----------------------------------------------------
     def run_once_cycle(self, user_msg: Optional[str] = None) -> List[Dict[str, Any]]:
-        try:
-            prioritizer = getattr(self.arch, "prioritizer", None)
-            if prioritizer is not None:
-                prioritizer.reprioritize_all()
-        except Exception:
-            pass
+        jm = getattr(self, "job_manager", None)
 
-        self.scheduler.tick()
+        skip_reprioritize = False
+        if user_msg:
+            skip_reprioritize = True
+        elif jm and jm.has_urgent():
+            skip_reprioritize = True
+        elif self._has_pending_urgent_trigger():
+            skip_reprioritize = True
+
+        if not skip_reprioritize:
+            try:
+                prioritizer = getattr(self.arch, "prioritizer", None)
+                if prioritizer is not None:
+                    prioritizer.reprioritize_all()
+            except Exception:
+                pass
+
+        preemptive_urgent = False
+        if jm:
+            if user_msg:
+                preemptive_urgent = True
+            elif self._has_pending_urgent_trigger():
+                preemptive_urgent = True
+        if preemptive_urgent:
+            jm.enter_urgent_context()
+        try:
+            if not (jm and jm.has_urgent()):
+                self.scheduler.tick()
+        finally:
+            if preemptive_urgent:
+                jm.exit_urgent_context()
         self.job_manager.drain_to_memory(self._memory_store)
 
         try:
@@ -2623,6 +2673,20 @@ class Orchestrator:
         return result
 
     def _run_pipeline(self, trigger: Trigger) -> Dict[str, Any]:
+        jm = getattr(self, "job_manager", None)
+        urgent_context = bool(
+            jm
+            and trigger.type in {TriggerType.SIGNAL, TriggerType.NEED, TriggerType.THREAT}
+        )
+        if urgent_context:
+            jm.enter_urgent_context()
+        try:
+            return self._run_pipeline_impl(trigger)
+        finally:
+            if urgent_context:
+                jm.exit_urgent_context()
+
+    def _run_pipeline_impl(self, trigger: Trigger) -> Dict[str, Any]:
         if self.immediate_question_blocked:
             meta = trigger.meta or {}
             try:

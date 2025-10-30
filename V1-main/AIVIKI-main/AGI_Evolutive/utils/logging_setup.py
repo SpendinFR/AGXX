@@ -8,6 +8,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 _DEFAULT_LOG_PATH = Path(os.environ.get("AGI_LOG_PATH", "runtime/logs/agi_evolutive.log"))
 _CONFIGURED_PATH: Optional[Path] = None
 
@@ -42,9 +44,11 @@ def configure_logging(log_path: Optional[str] = None, level: Optional[str] = Non
         root_logger.removeHandler(handler)
 
     resolved_level = _resolve_level(level)
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(resolved_level)
 
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(threadName)s | pid=%(process)d | %(message)s"
+    )
 
     file_handler = RotatingFileHandler(
         target,
@@ -57,7 +61,9 @@ def configure_logging(log_path: Optional[str] = None, level: Optional[str] = Non
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(resolved_level)
-    console_handler.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
+    console_handler.setFormatter(
+        logging.Formatter("%(levelname)s | %(name)s | %(message)s")
+    )
 
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
@@ -73,6 +79,10 @@ def configure_logging(log_path: Optional[str] = None, level: Optional[str] = Non
         )
 
     sys.excepthook = _handle_exception
+
+    logger.debug(
+        "Logging configured", extra={"log_path": str(target), "level": logging.getLevelName(resolved_level)}
+    )
 
     _CONFIGURED_PATH = target
     return target

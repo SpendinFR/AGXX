@@ -2,10 +2,15 @@
 # idempotence, progrès, persistance JSONL, drain des complétions côté thread principal).
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, List, Deque, Tuple
+from typing import Any, Callable, Dict, Optional, List, Deque, Tuple, Type
+from contextlib import contextmanager, nullcontext
 import time, threading, heapq, os, json, uuid, traceback, collections, math, random, logging
+try:  # pragma: no cover - defensive import guard
+    import ctypes
+except Exception:  # pragma: no cover - platform fallback
+    ctypes = None
 
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import bind_job_manager, try_call_llm_dict
 
 
 LOGGER = logging.getLogger(__name__)
@@ -13,6 +18,10 @@ LOGGER = logging.getLogger(__name__)
 
 def _now() -> float:
     return time.time()
+
+
+class JobPreempted(Exception):
+    """Exception injected in worker threads to preempt non-urgent jobs."""
 
 
 @dataclass(order=True)
@@ -34,6 +43,8 @@ class Job:
     kind: str  # ex: "io", "compute", "nlp"
     queue: str  # "interactive" | "background"
     priority: float  # 0..1
+    urgent: bool = False
+    requested_queue: str = "background"
     fn: Optional[Callable] = field(repr=False, default=None)
     args: Dict[str, Any] = field(default_factory=dict)
     key: Optional[str] = None  # idempotence key (même job)
@@ -153,6 +164,7 @@ class JobManager:
         self._jobs: Dict[str, Job] = {}
         self._key_map: Dict[str, str] = {}  # key -> job_id (idempotence)
         self._cancelled: set[str] = set()
+        self._pq_urgent: List[_PQItem] = []
         self._pq_inter: List[_PQItem] = []
         self._pq_back: List[_PQItem] = []
         self._completions: Deque[Dict[str, Any]] = collections.deque(maxlen=512)
@@ -170,9 +182,17 @@ class JobManager:
         self._lane_stats: Dict[str, Dict[str, Any]] = {
             "interactive": {"count": 0},
             "background": {"count": 0},
+            "urgent": {"count": 0},
         }
         self._running_inter = 0
         self._running_back = 0
+        self._running_urgent = 0
+        self._urgent_capacity = max(1, int(workers_interactive))
+        self._urgent_context = 0
+        self._urgent_thread_counts: Dict[int, int] = {}
+        self._urgent_local = threading.local()
+        self._pause_cond = threading.Condition(self._lock)
+        self._thread_jobs: Dict[int, str] = {}
 
         # Démarre les workers
         self._alive = True
@@ -181,6 +201,11 @@ class JobManager:
             t = threading.Thread(target=self._worker_loop, args=("interactive",), daemon=True)
             t.start()
             self._workers.append(t)
+
+        try:
+            bind_job_manager(self)
+        except Exception:
+            pass
         for _ in range(workers_background):
             t = threading.Thread(target=self._worker_loop, args=("background",), daemon=True)
             t.start()
@@ -244,11 +269,18 @@ class JobManager:
         priority: float = 0.5,
         key: Optional[str] = None,
         timeout_s: Optional[float] = None,
+        urgent: Optional[bool] = None,
     ) -> str:
         """Dépose un job. Idempotent si `key` est fournie."""
         args = args or {}
         priority = max(0.0, min(1.0, float(priority)))
         queue = "interactive" if queue == "interactive" else "background"
+        if urgent is None:
+            urgent = self.current_thread_is_urgent()
+        urgent = bool(urgent)
+        requested_queue = queue
+        if urgent:
+            queue = "interactive"
 
         with self._lock:
             if key and key in self._key_map:
@@ -263,6 +295,8 @@ class JobManager:
                 kind=kind,
                 queue=queue,
                 priority=priority,
+                urgent=urgent,
+                requested_queue=requested_queue,
                 fn=fn,
                 args=args,
                 key=key,
@@ -290,6 +324,7 @@ class JobManager:
                     "exploration_noise": noise,
                     "adjusted_priority": adjusted_priority,
                     "context_size": len(context_features),
+                    "urgent": job.urgent,
                 }
             )
             if llm_overlay is not None:
@@ -361,17 +396,144 @@ class JobManager:
                 pass
         return n
 
+    def _mark_thread_urgent(self) -> None:
+        ident = threading.get_ident()
+        depth = getattr(self._urgent_local, "depth", 0) + 1
+        self._urgent_local.depth = depth
+        with self._lock:
+            self._urgent_thread_counts[ident] = self._urgent_thread_counts.get(ident, 0) + 1
+
+    def _unmark_thread_urgent(self) -> None:
+        ident = threading.get_ident()
+        depth = getattr(self._urgent_local, "depth", 0)
+        if depth > 1:
+            self._urgent_local.depth = depth - 1
+        else:
+            self._urgent_local.depth = 0
+        with self._lock:
+            count = self._urgent_thread_counts.get(ident, 0)
+            if count <= 1:
+                self._urgent_thread_counts.pop(ident, None)
+            else:
+                self._urgent_thread_counts[ident] = count - 1
+
+    def enter_urgent_context(self) -> None:
+        prior_depth = getattr(self._urgent_local, "depth", 0)
+        self._mark_thread_urgent()
+        with self._lock:
+            self._urgent_context += 1
+            if self._urgent_context == 1 and prior_depth == 0:
+                self._pause_cond.notify_all()
+
+    def exit_urgent_context(self) -> None:
+        self._unmark_thread_urgent()
+        with self._lock:
+            self._urgent_context = max(0, self._urgent_context - 1)
+            if self._urgent_context == 0:
+                self._pause_cond.notify_all()
+
+    def has_urgent_context(self) -> bool:
+        with self._lock:
+            return self._urgent_context > 0
+
+    def current_thread_is_urgent(self) -> bool:
+        if getattr(self._urgent_local, "depth", 0) > 0:
+            return True
+        ident = threading.get_ident()
+        with self._lock:
+            return self._urgent_thread_counts.get(ident, 0) > 0
+
+    def has_urgent(self) -> bool:
+        with self._lock:
+            return self._urgent_active_locked()
+
+    def _nonurgent_running_locked(self) -> int:
+        inter_nonurgent = max(0, self._running_inter - self._running_urgent)
+        back = max(0, self._running_back)
+        return inter_nonurgent + back
+
+    def _urgent_active_locked(self) -> bool:
+        return (
+            self._urgent_context > 0
+            or self._running_urgent > 0
+            or bool(self._pq_urgent)
+        )
+
+    def wait_for_urgent_clear(self, timeout: Optional[float] = None) -> bool:
+        """Block until the urgent lane is idle or the timeout expires."""
+
+        deadline = None
+        if timeout is not None:
+            deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._lock:
+            while self._urgent_active_locked():
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._pause_cond.wait(timeout=remaining)
+                else:
+                    self._pause_cond.wait()
+        return True
+
+    def preempt_nonurgent(self) -> int:
+        """Force running non-urgent jobs to stop and get re-queued."""
+
+        if ctypes is None:
+            return 0
+        current_ident = threading.get_ident()
+        with self._lock:
+            targets: List[Tuple[int, Optional[Job]]] = [
+                (ident, self._jobs.get(job_id))
+                for ident, job_id in self._thread_jobs.items()
+                if ident != current_ident
+            ]
+        preempted = 0
+        cancelled: List[str] = []
+        for ident, job in targets:
+            if ident is None:
+                continue
+            if not job or job.urgent:
+                continue
+            if self._raise_async_exception(ident, JobPreempted):
+                preempted += 1
+                cancelled.append(job.id)
+        if preempted:
+            self._log({"event": "preempt_request", "count": preempted, "jobs": cancelled})
+        return preempted
+
+    @contextmanager
+    def urgent_section(self):
+        self.enter_urgent_context()
+        try:
+            yield
+        finally:
+            self.exit_urgent_context()
+
     # ------------------- internes -------------------
     def _push_pq(self, job: Job):
         self._seq += 1
         item = _PQItem(neg_prio=-float(job.priority), created_ts=job.created_ts, seq=self._seq, job_id=job.id)
-        if job.queue == "interactive":
+        if job.urgent:
+            heapq.heappush(self._pq_urgent, item)
+        elif job.queue == "interactive":
             heapq.heappush(self._pq_inter, item)
         else:
             heapq.heappush(self._pq_back, item)
 
     def _pop_next(self, lane: str) -> Optional[str]:
         with self._lock:
+            if self._urgent_context > 0 or self._pq_urgent or self._running_urgent > 0:
+                if lane != "interactive":
+                    return None
+                if self._pq_urgent:
+                    if self._running_urgent >= self._urgent_capacity:
+                        return None
+                    item = heapq.heappop(self._pq_urgent)
+                    return item.job_id
+                if self._running_urgent >= self._urgent_capacity:
+                    return None
+                return None
             pq = self._pq_inter if lane == "interactive" else self._pq_back
             if not pq:
                 return None
@@ -485,10 +647,14 @@ class JobManager:
     def _start_job(self, j: Job):
         j.status = "running"
         j.started_ts = _now()
-        if j.queue == "interactive":
-            self._running_inter += 1
-        else:
-            self._running_back += 1
+        with self._lock:
+            if j.urgent:
+                self._running_urgent += 1
+            if j.queue == "interactive":
+                self._running_inter += 1
+            else:
+                self._running_back += 1
+            self._thread_jobs[threading.get_ident()] = j.id
         self._log({"event": "start", "job": self._job_view(j)})
 
     def _finish_job(self, j: Job, ok: bool, result: Any = None, error: Optional[str] = None, trace: Optional[str] = None):
@@ -497,10 +663,14 @@ class JobManager:
         j.result = result
         j.error = error
         j.trace = trace
-        if j.queue == "interactive":
-            self._running_inter = max(0, self._running_inter - 1)
-        else:
-            self._running_back = max(0, self._running_back - 1)
+        with self._lock:
+            if j.urgent:
+                self._running_urgent = max(0, self._running_urgent - 1)
+            if j.queue == "interactive":
+                self._running_inter = max(0, self._running_inter - 1)
+            else:
+                self._running_back = max(0, self._running_back - 1)
+            self._pause_cond.notify_all()
         reward, latency = self._compute_reward(j)
         success_flag = 1.0 if j.status == "done" else 0.0
         j.metrics.update(
@@ -509,6 +679,7 @@ class JobManager:
                 "latency_s": latency,
                 "success": success_flag,
                 "finished_ts": j.finished_ts,
+                "urgent": j.urgent,
             }
         )
         event_payload = {
@@ -544,6 +715,45 @@ class JobManager:
         with self._lock:
             return job_id in self._cancelled
 
+    def _handle_preempt(self, j: Job) -> None:
+        with self._lock:
+            if j.urgent:
+                self._running_urgent = max(0, self._running_urgent - 1)
+            if j.queue == "interactive":
+                self._running_inter = max(0, self._running_inter - 1)
+            else:
+                self._running_back = max(0, self._running_back - 1)
+            j.status = "queued"
+            j.started_ts = 0.0
+            j.finished_ts = 0.0
+            j.created_ts = _now()
+            j.result = None
+            j.error = None
+            j.trace = None
+            j.metrics.pop("latency_s", None)
+            self._push_pq(j)
+            self._pause_cond.notify_all()
+        self._log({"event": "preempted", "job": self._job_view(j)})
+
+    def _raise_async_exception(self, thread_id: int, exc_type: Type[BaseException]) -> bool:
+        if ctypes is None or thread_id is None:
+            return False
+        try:
+            result = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_long(thread_id), ctypes.py_object(exc_type)
+            )
+        except Exception:
+            return False
+        if result == 0:
+            return False
+        if result > 1:
+            try:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread_id), None)
+            except Exception:
+                pass
+            return False
+        return True
+
     def _worker_loop(self, lane: str):
         while self._alive:
             jid = self._pop_next(lane)
@@ -561,16 +771,29 @@ class JobManager:
             self._start_job(j)
             ctx = JobContext(self, j.id)
             ok, result, err, tr = True, None, None, None
+            runner_context = self.urgent_section() if j.urgent else nullcontext()
+            thread_ident = threading.get_ident()
+            preempted = False
             try:
-                # timeout soft: on laisse la fonction vérifier ctx.cancelled() périodiquement
-                result = j.fn(ctx, j.args or {})
+                with runner_context:
+                    # timeout soft: on laisse la fonction vérifier ctx.cancelled() périodiquement
+                    result = j.fn(ctx, j.args or {})
+            except JobPreempted:
+                preempted = True
+                self._handle_preempt(j)
             except Exception as e:
                 ok, err = False, str(e)
                 tr = traceback.format_exc()
+            if preempted:
+                with self._lock:
+                    self._thread_jobs.pop(thread_ident, None)
+                continue
             # cancellation après exécution ?
             if self._is_cancelled(j.id) and ok:
                 ok, err = False, "cancelled"
             self._finish_job(j, ok=ok, result=result, error=err, trace=tr)
+            with self._lock:
+                self._thread_jobs.pop(thread_ident, None)
 
     def _job_view(self, j: Optional[Job]) -> Optional[Dict[str, Any]]:
         if not j:
@@ -587,6 +810,8 @@ class JobManager:
             "finished_ts": j.finished_ts,
             "timeout_s": j.timeout_s,
             "key": j.key,
+            "urgent": j.urgent,
+            "requested_queue": j.requested_queue,
         }
 
     def _log(self, obj: Dict[str, Any]):
@@ -612,7 +837,7 @@ class JobManager:
             "current": {
                 "focus_topic": None,
                 "jobs_running": [],
-                "loads": {"interactive": 0, "background": 0},
+                "loads": {"interactive": 0, "background": 0, "urgent": 0},
             },
             "recent": [],
         }
@@ -621,8 +846,10 @@ class JobManager:
                 jobs = list(self._jobs.values())
                 pq_inter = len(self._pq_inter)
                 pq_back = len(self._pq_back)
+                pq_urgent = len(self._pq_urgent)
                 running_inter = self._running_inter
                 running_back = self._running_back
+                running_urgent = self._running_urgent
                 budget_inter = self.budgets["interactive"]["max_running"]
                 budget_back = self.budgets["background"]["max_running"]
 
@@ -647,6 +874,7 @@ class JobManager:
 
             view["current"]["loads"]["interactive"] = running_inter + pq_inter
             view["current"]["loads"]["background"] = running_back + pq_back
+            view["current"]["loads"]["urgent"] = running_urgent + pq_urgent
             view["current"]["budgets"] = {
                 "interactive": budget_inter,
                 "background": budget_back,

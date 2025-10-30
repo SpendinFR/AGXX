@@ -10,7 +10,11 @@ try:  # pragma: no cover - defensive import guard
 except Exception:  # pragma: no cover - platform fallback
     ctypes = None
 
-from AGI_Evolutive.utils.llm_service import bind_job_manager, try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import (
+    bind_job_manager,
+    try_call_llm_dict,
+    LLMPreempted,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -778,7 +782,7 @@ class JobManager:
                 with runner_context:
                     # timeout soft: on laisse la fonction vérifier ctx.cancelled() périodiquement
                     result = j.fn(ctx, j.args or {})
-            except JobPreempted:
+            except (JobPreempted, LLMPreempted):
                 preempted = True
                 self._handle_preempt(j)
             except Exception as e:

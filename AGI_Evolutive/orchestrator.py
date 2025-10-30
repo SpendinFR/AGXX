@@ -75,6 +75,7 @@ from AGI_Evolutive.utils.llm_service import (
     LLMUnavailableError,
     get_llm_manager,
     is_llm_enabled,
+    preempt_background_llm_calls,
     try_call_llm_dict,
 )
 
@@ -2236,6 +2237,7 @@ class Orchestrator:
             with jm.urgent_section():
                 try:
                     jm.preempt_nonurgent()
+                    preempt_background_llm_calls()
                 except Exception:
                     logger.exception("Échec lors de la préemption des jobs non urgents")
                 return self._run_once_cycle_impl(user_msg=user_msg)

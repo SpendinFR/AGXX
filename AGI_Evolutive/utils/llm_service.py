@@ -70,6 +70,10 @@ class LLMCallRecord:
 _ACTIVITY_LOG: deque[LLMCallRecord] = deque(maxlen=200)
 
 
+_JOB_MANAGER_BINDING_LOCK = threading.Lock()
+_JOB_MANAGER_BINDING: Optional[Any] = None
+
+
 def _record_activity(spec_key: str, status: str, message: Optional[str] = None) -> None:
     try:
         _ACTIVITY_LOG.appendleft(
@@ -82,6 +86,19 @@ def _record_activity(spec_key: str, status: str, message: Optional[str] = None) 
         )
     except Exception:  # pragma: no cover - defensive guard for diagnostics
         pass
+
+
+def bind_job_manager(job_manager: Optional[Any]) -> None:
+    """Expose the shared job manager so LLM calls can respect urgent contexts."""
+
+    with _JOB_MANAGER_BINDING_LOCK:
+        global _JOB_MANAGER_BINDING
+        _JOB_MANAGER_BINDING = job_manager
+
+
+def _get_bound_job_manager() -> Optional[Any]:
+    with _JOB_MANAGER_BINDING_LOCK:
+        return _JOB_MANAGER_BINDING
 
 
 def get_recent_llm_activity(limit: int = 20) -> Sequence[LLMCallRecord]:
@@ -220,6 +237,40 @@ def try_call_llm_dict(
     thread_name = thread.name or "Thread"
     thread_identifier = f"{thread_name}#{thread.ident}" if thread.ident is not None else thread_name
 
+    job_manager = _get_bound_job_manager()
+    if job_manager is not None:
+        try:
+            thread_is_urgent = bool(job_manager.current_thread_is_urgent())
+        except Exception:
+            thread_is_urgent = False
+        if not thread_is_urgent:
+            wait_start = time.perf_counter()
+            notified = False
+            while True:
+                try:
+                    if not bool(job_manager.has_urgent()):
+                        break
+                except Exception:
+                    break
+                try:
+                    if bool(job_manager.current_thread_is_urgent()):
+                        break
+                except Exception:
+                    pass
+                if not notified:
+                    try:
+                        log.debug(
+                            "LLM spec '%s' en pause : travail urgent en cours – thread %s",
+                            spec_key,
+                            thread_identifier,
+                        )
+                    except Exception:
+                        pass
+                    notified = True
+                if time.perf_counter() - wait_start > 60.0:
+                    break
+                time.sleep(0.05)
+
     if not is_llm_enabled():
         _record_activity(spec_key, "disabled", "LLM integration désactivée")
         try:
@@ -294,6 +345,7 @@ __all__ = [
     "LLMInvocation",
     "LLMCallRecord",
     "LLMUnavailableError",
+    "bind_job_manager",
     "get_llm_manager",
     "get_recent_llm_activity",
     "is_llm_enabled",

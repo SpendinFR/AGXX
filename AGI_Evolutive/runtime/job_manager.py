@@ -3,10 +3,10 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, List, Deque, Tuple
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import time, threading, heapq, os, json, uuid, traceback, collections, math, random, logging
 
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import bind_job_manager, try_call_llm_dict
 
 
 LOGGER = logging.getLogger(__name__)
@@ -181,6 +181,8 @@ class JobManager:
         self._running_urgent = 0
         self._urgent_capacity = max(1, int(workers_interactive))
         self._urgent_context = 0
+        self._urgent_thread_counts: Dict[int, int] = {}
+        self._urgent_local = threading.local()
 
         # Démarre les workers
         self._alive = True
@@ -189,6 +191,11 @@ class JobManager:
             t = threading.Thread(target=self._worker_loop, args=("interactive",), daemon=True)
             t.start()
             self._workers.append(t)
+
+        try:
+            bind_job_manager(self)
+        except Exception:
+            pass
         for _ in range(workers_background):
             t = threading.Thread(target=self._worker_loop, args=("background",), daemon=True)
             t.start()
@@ -379,17 +386,47 @@ class JobManager:
                 pass
         return n
 
+    def _mark_thread_urgent(self) -> None:
+        ident = threading.get_ident()
+        depth = getattr(self._urgent_local, "depth", 0) + 1
+        self._urgent_local.depth = depth
+        with self._lock:
+            self._urgent_thread_counts[ident] = self._urgent_thread_counts.get(ident, 0) + 1
+
+    def _unmark_thread_urgent(self) -> None:
+        ident = threading.get_ident()
+        depth = getattr(self._urgent_local, "depth", 0)
+        if depth > 1:
+            self._urgent_local.depth = depth - 1
+        else:
+            self._urgent_local.depth = 0
+        with self._lock:
+            count = self._urgent_thread_counts.get(ident, 0)
+            if count <= 1:
+                self._urgent_thread_counts.pop(ident, None)
+            else:
+                self._urgent_thread_counts[ident] = count - 1
+
     def enter_urgent_context(self) -> None:
+        self._mark_thread_urgent()
         with self._lock:
             self._urgent_context += 1
 
     def exit_urgent_context(self) -> None:
+        self._unmark_thread_urgent()
         with self._lock:
             self._urgent_context = max(0, self._urgent_context - 1)
 
     def has_urgent_context(self) -> bool:
         with self._lock:
             return self._urgent_context > 0
+
+    def current_thread_is_urgent(self) -> bool:
+        if getattr(self._urgent_local, "depth", 0) > 0:
+            return True
+        ident = threading.get_ident()
+        with self._lock:
+            return self._urgent_thread_counts.get(ident, 0) > 0
 
     def has_urgent(self) -> bool:
         with self._lock:
@@ -625,9 +662,11 @@ class JobManager:
             self._start_job(j)
             ctx = JobContext(self, j.id)
             ok, result, err, tr = True, None, None, None
+            runner_context = self.urgent_section() if j.urgent else nullcontext()
             try:
-                # timeout soft: on laisse la fonction vérifier ctx.cancelled() périodiquement
-                result = j.fn(ctx, j.args or {})
+                with runner_context:
+                    # timeout soft: on laisse la fonction vérifier ctx.cancelled() périodiquement
+                    result = j.fn(ctx, j.args or {})
             except Exception as e:
                 ok, err = False, str(e)
                 tr = traceback.format_exc()

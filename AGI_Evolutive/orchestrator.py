@@ -2209,7 +2209,9 @@ class Orchestrator:
         except Exception:
             pass
 
-        self.scheduler.tick()
+        jm = getattr(self, "job_manager", None)
+        if not (jm and jm.has_urgent()):
+            self.scheduler.tick()
         self.job_manager.drain_to_memory(self._memory_store)
 
         try:
@@ -2623,6 +2625,20 @@ class Orchestrator:
         return result
 
     def _run_pipeline(self, trigger: Trigger) -> Dict[str, Any]:
+        jm = getattr(self, "job_manager", None)
+        urgent_context = bool(
+            jm
+            and trigger.type in {TriggerType.SIGNAL, TriggerType.NEED, TriggerType.THREAT}
+        )
+        if urgent_context:
+            jm.enter_urgent_context()
+        try:
+            return self._run_pipeline_impl(trigger)
+        finally:
+            if urgent_context:
+                jm.exit_urgent_context()
+
+    def _run_pipeline_impl(self, trigger: Trigger) -> Dict[str, Any]:
         if self.immediate_question_blocked:
             meta = trigger.meta or {}
             try:

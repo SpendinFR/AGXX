@@ -183,8 +183,6 @@ class JobManager:
         self._urgent_context = 0
         self._urgent_thread_counts: Dict[int, int] = {}
         self._urgent_local = threading.local()
-        self._pause_requested = False
-        self._pause_cond = threading.Condition(self._lock)
 
         # Démarre les workers
         self._alive = True
@@ -411,28 +409,13 @@ class JobManager:
 
     def enter_urgent_context(self) -> None:
         self._mark_thread_urgent()
-        wait_for_drain = False
         with self._lock:
             self._urgent_context += 1
-            if self._urgent_context == 1:
-                self._pause_requested = True
-                wait_for_drain = True
-        if wait_for_drain:
-            deadline = time.perf_counter() + 30.0
-            with self._lock:
-                while self._pause_requested and self._nonurgent_running_locked() > 0:
-                    remaining = deadline - time.perf_counter()
-                    if remaining <= 0:
-                        break
-                    self._pause_cond.wait(timeout=min(0.5, remaining))
 
     def exit_urgent_context(self) -> None:
         self._unmark_thread_urgent()
         with self._lock:
             self._urgent_context = max(0, self._urgent_context - 1)
-            if self._urgent_context == 0:
-                self._pause_requested = False
-                self._pause_cond.notify_all()
 
     def has_urgent_context(self) -> bool:
         with self._lock:
@@ -452,10 +435,6 @@ class JobManager:
                 or self._running_urgent > 0
                 or bool(self._pq_urgent)
             )
-
-    def _nonurgent_running_locked(self) -> int:
-        total = self._running_inter + self._running_back
-        return max(0, total - self._running_urgent)
 
     @contextmanager
     def urgent_section(self):
@@ -624,8 +603,6 @@ class JobManager:
                 self._running_inter = max(0, self._running_inter - 1)
             else:
                 self._running_back = max(0, self._running_back - 1)
-            if self._pause_requested and self._nonurgent_running_locked() == 0:
-                self._pause_cond.notify_all()
         reward, latency = self._compute_reward(j)
         success_flag = 1.0 if j.status == "done" else 0.0
         j.metrics.update(

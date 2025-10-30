@@ -266,7 +266,7 @@ class JobManager:
         priority = max(0.0, min(1.0, float(priority)))
         queue = "interactive" if queue == "interactive" else "background"
         if urgent is None:
-            urgent = self.has_urgent_context()
+            urgent = self.current_thread_is_urgent()
         urgent = bool(urgent)
         requested_queue = queue
         if urgent:

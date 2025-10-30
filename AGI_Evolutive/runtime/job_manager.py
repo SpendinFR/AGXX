@@ -183,6 +183,7 @@ class JobManager:
         self._urgent_context = 0
         self._urgent_thread_counts: Dict[int, int] = {}
         self._urgent_local = threading.local()
+        self._pause_cond = threading.Condition(self._lock)
 
         # Démarre les workers
         self._alive = True
@@ -408,14 +409,19 @@ class JobManager:
                 self._urgent_thread_counts[ident] = count - 1
 
     def enter_urgent_context(self) -> None:
+        prior_depth = getattr(self._urgent_local, "depth", 0)
         self._mark_thread_urgent()
         with self._lock:
             self._urgent_context += 1
+            if self._urgent_context == 1 and prior_depth == 0:
+                self._pause_cond.notify_all()
 
     def exit_urgent_context(self) -> None:
         self._unmark_thread_urgent()
         with self._lock:
             self._urgent_context = max(0, self._urgent_context - 1)
+            if self._urgent_context == 0:
+                self._pause_cond.notify_all()
 
     def has_urgent_context(self) -> bool:
         with self._lock:
@@ -430,11 +436,36 @@ class JobManager:
 
     def has_urgent(self) -> bool:
         with self._lock:
-            return (
-                self._urgent_context > 0
-                or self._running_urgent > 0
-                or bool(self._pq_urgent)
-            )
+            return self._urgent_active_locked()
+
+    def _nonurgent_running_locked(self) -> int:
+        inter_nonurgent = max(0, self._running_inter - self._running_urgent)
+        back = max(0, self._running_back)
+        return inter_nonurgent + back
+
+    def _urgent_active_locked(self) -> bool:
+        return (
+            self._urgent_context > 0
+            or self._running_urgent > 0
+            or bool(self._pq_urgent)
+        )
+
+    def wait_for_urgent_clear(self, timeout: Optional[float] = None) -> bool:
+        """Block until the urgent lane is idle or the timeout expires."""
+
+        deadline = None
+        if timeout is not None:
+            deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._lock:
+            while self._urgent_active_locked():
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._pause_cond.wait(timeout=remaining)
+                else:
+                    self._pause_cond.wait()
+        return True
 
     @contextmanager
     def urgent_section(self):
@@ -581,12 +612,13 @@ class JobManager:
     def _start_job(self, j: Job):
         j.status = "running"
         j.started_ts = _now()
-        if j.urgent:
-            self._running_urgent += 1
-        if j.queue == "interactive":
-            self._running_inter += 1
-        else:
-            self._running_back += 1
+        with self._lock:
+            if j.urgent:
+                self._running_urgent += 1
+            if j.queue == "interactive":
+                self._running_inter += 1
+            else:
+                self._running_back += 1
         self._log({"event": "start", "job": self._job_view(j)})
 
     def _finish_job(self, j: Job, ok: bool, result: Any = None, error: Optional[str] = None, trace: Optional[str] = None):
@@ -595,12 +627,14 @@ class JobManager:
         j.result = result
         j.error = error
         j.trace = trace
-        if j.urgent:
-            self._running_urgent = max(0, self._running_urgent - 1)
-        if j.queue == "interactive":
-            self._running_inter = max(0, self._running_inter - 1)
-        else:
-            self._running_back = max(0, self._running_back - 1)
+        with self._lock:
+            if j.urgent:
+                self._running_urgent = max(0, self._running_urgent - 1)
+            if j.queue == "interactive":
+                self._running_inter = max(0, self._running_inter - 1)
+            else:
+                self._running_back = max(0, self._running_back - 1)
+            self._pause_cond.notify_all()
         reward, latency = self._compute_reward(j)
         success_flag = 1.0 if j.status == "done" else 0.0
         j.metrics.update(

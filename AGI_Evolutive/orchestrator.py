@@ -75,6 +75,7 @@ from AGI_Evolutive.utils.llm_service import (
     LLMUnavailableError,
     get_llm_manager,
     is_llm_enabled,
+    preempt_background_llm_calls,
     try_call_llm_dict,
 )
 
@@ -1108,6 +1109,22 @@ class Orchestrator:
             job_manager = existing_jobs
 
         self.job_manager = job_manager
+        try:
+            self.telemetry.bind_job_manager(job_manager)
+        except Exception:
+            pass
+        arch_tm = getattr(self.arch, "telemetry", None)
+        if arch_tm is not None and hasattr(arch_tm, "bind_job_manager"):
+            try:
+                arch_tm.bind_job_manager(job_manager)
+            except Exception:
+                pass
+        arch_goals = getattr(self.arch, "goals", None)
+        if arch_goals is not None and hasattr(arch_goals, "bind_job_manager"):
+            try:
+                arch_goals.bind_job_manager(job_manager)
+            except Exception:
+                pass
         self._phenomenal_kernel = PhenomenalKernel()
         self.phenomenal_journal = getattr(self, "phenomenal_journal", None) or PhenomenalJournal()
         self.phenomenal_recall = getattr(self, "phenomenal_recall", None) or PhenomenalRecall(
@@ -2200,17 +2217,55 @@ class Orchestrator:
         self._pending_system_alerts = alerts
         return alerts
 
+    def _has_pending_urgent_trigger(self) -> bool:
+        pending = getattr(self, "_pending_triggers", None)
+        if not pending:
+            return False
+        urgent_types = {TriggerType.SIGNAL, TriggerType.NEED, TriggerType.THREAT}
+        for trig in pending:
+            if getattr(trig, "type", None) in urgent_types:
+                return True
+        return False
+
     # --- Cycle principal ----------------------------------------------------
     def run_once_cycle(self, user_msg: Optional[str] = None) -> List[Dict[str, Any]]:
-        try:
-            prioritizer = getattr(self.arch, "prioritizer", None)
-            if prioritizer is not None:
-                prioritizer.reprioritize_all()
-        except Exception:
-            pass
+        jm = getattr(self, "job_manager", None)
+        urgent_context = bool(
+            jm and (user_msg is not None or self._has_pending_urgent_trigger())
+        )
+        if urgent_context:
+            with jm.urgent_section():
+                try:
+                    jm.preempt_nonurgent()
+                    preempt_background_llm_calls()
+                except Exception:
+                    logger.exception("Échec lors de la préemption des jobs non urgents")
+                return self._run_once_cycle_impl(user_msg=user_msg)
+        return self._run_once_cycle_impl(user_msg=user_msg)
 
-        self.scheduler.tick()
-        self.job_manager.drain_to_memory(self._memory_store)
+    def _run_once_cycle_impl(self, *, user_msg: Optional[str] = None) -> List[Dict[str, Any]]:
+        jm = getattr(self, "job_manager", None)
+
+        skip_reprioritize = False
+        if user_msg:
+            skip_reprioritize = True
+        elif jm and jm.has_urgent():
+            skip_reprioritize = True
+        elif self._has_pending_urgent_trigger():
+            skip_reprioritize = True
+
+        if not skip_reprioritize:
+            try:
+                prioritizer = getattr(self.arch, "prioritizer", None)
+                if prioritizer is not None:
+                    prioritizer.reprioritize_all()
+            except Exception:
+                pass
+
+        if not (jm and jm.has_urgent()):
+            self.scheduler.tick()
+        if jm is not None:
+            jm.drain_to_memory(self._memory_store)
 
         try:
             self._sj_conf_cache = self._sj_config_model.current_config()
@@ -2623,6 +2678,20 @@ class Orchestrator:
         return result
 
     def _run_pipeline(self, trigger: Trigger) -> Dict[str, Any]:
+        jm = getattr(self, "job_manager", None)
+        urgent_context = bool(
+            jm
+            and trigger.type in {TriggerType.SIGNAL, TriggerType.NEED, TriggerType.THREAT}
+        )
+        if urgent_context:
+            jm.enter_urgent_context()
+        try:
+            return self._run_pipeline_impl(trigger)
+        finally:
+            if urgent_context:
+                jm.exit_urgent_context()
+
+    def _run_pipeline_impl(self, trigger: Trigger) -> Dict[str, Any]:
         if self.immediate_question_blocked:
             meta = trigger.meta or {}
             try:

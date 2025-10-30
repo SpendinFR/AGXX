@@ -9,6 +9,11 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping, Optional, Sequence
 
+try:  # pragma: no cover - platform guard
+    import ctypes
+except Exception:  # pragma: no cover - environment without ctypes support
+    ctypes = None
+
 from itertools import islice
 
 from .llm_client import LLMCallError, LLMResult, OllamaLLMClient, OllamaModelConfig
@@ -49,6 +54,10 @@ class LLMUnavailableError(LLMIntegrationError):
     """Raised when LLM integration is disabled or unavailable."""
 
 
+class LLMPreempted(LLMIntegrationError):
+    """Raised internally when a background LLM call is interrupted."""
+
+
 @dataclass
 class LLMInvocation:
     """Encapsulate the result of one integration call."""
@@ -70,6 +79,12 @@ class LLMCallRecord:
 _ACTIVITY_LOG: deque[LLMCallRecord] = deque(maxlen=200)
 
 
+_JOB_MANAGER_BINDING_LOCK = threading.Lock()
+_JOB_MANAGER_BINDING: Optional[Any] = None
+_ACTIVE_LLM_CALLS_LOCK = threading.Lock()
+_ACTIVE_LLM_CALLS: dict[int, dict[str, Any]] = {}
+
+
 def _record_activity(spec_key: str, status: str, message: Optional[str] = None) -> None:
     try:
         _ACTIVITY_LOG.appendleft(
@@ -82,6 +97,70 @@ def _record_activity(spec_key: str, status: str, message: Optional[str] = None) 
         )
     except Exception:  # pragma: no cover - defensive guard for diagnostics
         pass
+
+
+def bind_job_manager(job_manager: Optional[Any]) -> None:
+    """Expose the shared job manager so LLM calls can respect urgent contexts."""
+
+    with _JOB_MANAGER_BINDING_LOCK:
+        global _JOB_MANAGER_BINDING
+        _JOB_MANAGER_BINDING = job_manager
+
+
+def _get_bound_job_manager() -> Optional[Any]:
+    with _JOB_MANAGER_BINDING_LOCK:
+        return _JOB_MANAGER_BINDING
+
+
+def _register_active_llm_call(spec_key: str, *, urgent: bool) -> None:
+    ident = threading.get_ident()
+    with _ACTIVE_LLM_CALLS_LOCK:
+        _ACTIVE_LLM_CALLS[ident] = {"spec": spec_key, "urgent": urgent}
+
+
+def _unregister_active_llm_call() -> None:
+    ident = threading.get_ident()
+    with _ACTIVE_LLM_CALLS_LOCK:
+        _ACTIVE_LLM_CALLS.pop(ident, None)
+
+
+def _raise_async_exception(thread_id: int, exc_type: type[BaseException]) -> bool:
+    if ctypes is None or thread_id is None:
+        return False
+    try:
+        result = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_long(thread_id), ctypes.py_object(exc_type)
+        )
+    except Exception:
+        return False
+    if result == 0:
+        return False
+    if result > 1:
+        try:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(thread_id), None)
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def preempt_background_llm_calls() -> int:
+    """Interrupt non-urgent LLM calls in progress.
+
+    Returns the number of threads that received a preemption signal.
+    """
+
+    with _ACTIVE_LLM_CALLS_LOCK:
+        targets = [
+            (ident, data)
+            for ident, data in _ACTIVE_LLM_CALLS.items()
+            if not data.get("urgent")
+        ]
+    preempted = 0
+    for ident, _ in targets:
+        if _raise_async_exception(ident, LLMPreempted):
+            preempted += 1
+    return preempted
 
 
 def get_recent_llm_activity(limit: int = 20) -> Sequence[LLMCallRecord]:
@@ -220,6 +299,38 @@ def try_call_llm_dict(
     thread_name = thread.name or "Thread"
     thread_identifier = f"{thread_name}#{thread.ident}" if thread.ident is not None else thread_name
 
+    job_manager = _get_bound_job_manager()
+    wait_after_call = False
+    thread_is_urgent = False
+    if job_manager is not None:
+        try:
+            thread_is_urgent = bool(job_manager.current_thread_is_urgent())
+        except Exception:
+            thread_is_urgent = False
+        if not thread_is_urgent:
+            wait_after_call = True
+            wait_deadline = time.perf_counter() + 60.0
+            notified = False
+            while True:
+                try:
+                    cleared = job_manager.wait_for_urgent_clear(timeout=0.1)
+                except Exception:
+                    break
+                if cleared:
+                    break
+                if not notified:
+                    try:
+                        log.debug(
+                            "LLM spec '%s' en pause : travail urgent en cours – thread %s",
+                            spec_key,
+                            thread_identifier,
+                        )
+                    except Exception:
+                        pass
+                    notified = True
+                if time.perf_counter() >= wait_deadline:
+                    break
+
     if not is_llm_enabled():
         _record_activity(spec_key, "disabled", "LLM integration désactivée")
         try:
@@ -233,6 +344,7 @@ def try_call_llm_dict(
         return None
 
     total_start = time.perf_counter()
+    _register_active_llm_call(spec_key, urgent=thread_is_urgent)
     try:
         manager = get_llm_manager()
         call_start = time.perf_counter()
@@ -244,8 +356,20 @@ def try_call_llm_dict(
         )
         call_elapsed = time.perf_counter() - call_start
         total_elapsed = time.perf_counter() - total_start
+        waited_for_clear = False
+        if wait_after_call and job_manager is not None and not thread_is_urgent:
+            try:
+                waited_for_clear = job_manager.wait_for_urgent_clear(timeout=60.0)
+            except Exception:
+                waited_for_clear = False
         _record_activity(spec_key, "success", None)
         try:
+            if waited_for_clear:
+                log.debug(
+                    "LLM spec '%s' reprise après fenêtre urgente – thread %s",
+                    spec_key,
+                    thread_identifier,
+                )
             log.info(
                 "LLM spec '%s' terminée avec succès en %.2fs (appel %.2fs) – thread %s",
                 spec_key,
@@ -271,6 +395,17 @@ def try_call_llm_dict(
         except Exception:  # pragma: no cover - defensive logging guard
             pass
         return None
+    except LLMPreempted:
+        _record_activity(spec_key, "cancelled", "preempted by urgent context")
+        try:
+            log.info(
+                "LLM spec '%s' annulée : préemption urgente – thread %s",
+                spec_key,
+                thread_identifier,
+            )
+        except Exception:
+            pass
+        raise
     except Exception as exc:  # pragma: no cover - unexpected failure safety net
         total_elapsed = time.perf_counter() - total_start
         _record_activity(spec_key, "error", str(exc))
@@ -286,6 +421,8 @@ def try_call_llm_dict(
         except Exception:
             pass
         return None
+    finally:
+        _unregister_active_llm_call()
 
 
 __all__ = [
@@ -294,9 +431,12 @@ __all__ = [
     "LLMInvocation",
     "LLMCallRecord",
     "LLMUnavailableError",
+    "LLMPreempted",
+    "bind_job_manager",
     "get_llm_manager",
     "get_recent_llm_activity",
     "is_llm_enabled",
+    "preempt_background_llm_calls",
     "set_llm_manager",
     "try_call_llm_dict",
 ]

@@ -9,7 +9,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import LLMPreempted, try_call_llm_dict
 
 
 class SemanticMemoryBridge:
@@ -115,6 +115,15 @@ class SemanticMemoryBridge:
                     self._manager.on_llm_annotations(llm_response)
                 except Exception:
                     LOGGER.debug("Semantic manager annotations hook failed", exc_info=True)
+        except LLMPreempted:
+            # Replace items at the front of the queue so they are retried after the urgent window.
+            for item in reversed(list(batch)):
+                try:
+                    self._queue.put_nowait(item)
+                except queue.Full:
+                    LOGGER.debug("Semantic bridge queue full while requeueing after preemption")
+                    break
+            return
         except Exception:
             LOGGER.debug("Semantic processing hook failed", exc_info=True)
 

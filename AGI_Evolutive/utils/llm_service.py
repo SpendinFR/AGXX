@@ -1,6 +1,7 @@
 """Service layer to orchestrate repository-wide LLM integrations."""
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -12,6 +13,9 @@ from itertools import islice
 
 from .llm_client import LLMCallError, LLMResult, OllamaLLMClient, OllamaModelConfig
 from .llm_specs import LLMIntegrationSpec, get_spec
+
+
+_module_logger = logging.getLogger(__name__)
 
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
@@ -211,42 +215,76 @@ def try_call_llm_dict(
     heuristics.
     """
 
+    log = logger or _module_logger
+    thread = threading.current_thread()
+    thread_name = thread.name or "Thread"
+    thread_identifier = f"{thread_name}#{thread.ident}" if thread.ident is not None else thread_name
+
     if not is_llm_enabled():
         _record_activity(spec_key, "disabled", "LLM integration désactivée")
+        try:
+            log.info(
+                "LLM spec '%s' ignorée : LLM désactivé – thread %s",
+                spec_key,
+                thread_identifier,
+            )
+        except Exception:  # pragma: no cover - defensive logging guard
+            pass
         return None
 
+    total_start = time.perf_counter()
     try:
         manager = get_llm_manager()
+        call_start = time.perf_counter()
         payload = manager.call_dict(
             spec_key,
             input_payload=input_payload,
             extra_instructions=extra_instructions,
             max_retries=max_retries,
         )
+        call_elapsed = time.perf_counter() - call_start
+        total_elapsed = time.perf_counter() - total_start
         _record_activity(spec_key, "success", None)
+        try:
+            log.info(
+                "LLM spec '%s' terminée avec succès en %.2fs (appel %.2fs) – thread %s",
+                spec_key,
+                total_elapsed,
+                call_elapsed,
+                thread_identifier,
+            )
+        except Exception:  # pragma: no cover - defensive logging guard
+            pass
         return payload
     except (LLMUnavailableError, LLMIntegrationError) as exc:
+        total_elapsed = time.perf_counter() - total_start
         _record_activity(spec_key, "error", str(exc))
-        if logger is not None:
-            try:
-                logger.debug(
-                    "LLM integration '%s' unavailable: %s", spec_key, exc, exc_info=True
-                )
-            except Exception:  # pragma: no cover - defensive logging guard
-                pass
+        try:
+            log.warning(
+                "LLM spec '%s' en échec après %.2fs : %s – thread %s",
+                spec_key,
+                total_elapsed,
+                exc,
+                thread_identifier,
+                exc_info=True,
+            )
+        except Exception:  # pragma: no cover - defensive logging guard
+            pass
         return None
     except Exception as exc:  # pragma: no cover - unexpected failure safety net
+        total_elapsed = time.perf_counter() - total_start
         _record_activity(spec_key, "error", str(exc))
-        if logger is not None:
-            try:
-                logger.warning(
-                    "Unexpected error while calling LLM integration '%s': %s",
-                    spec_key,
-                    exc,
-                    exc_info=True,
-                )
-            except Exception:
-                pass
+        try:
+            log.error(
+                "Erreur inattendue lors de la spec LLM '%s' après %.2fs : %s – thread %s",
+                spec_key,
+                total_elapsed,
+                exc,
+                thread_identifier,
+                exc_info=True,
+            )
+        except Exception:
+            pass
         return None
 
 

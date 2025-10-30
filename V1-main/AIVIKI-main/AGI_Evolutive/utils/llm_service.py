@@ -155,6 +155,7 @@ class LLMIntegrationManager:
             instructions.extend(instr.strip() for instr in extra_instructions if instr and instr.strip())
         instructions.append("Si tu n'es pas certain, explique l'incertitude dans le champ 'notes'.")
 
+        start = time.perf_counter()
         try:
             result = self._client.generate_json(
                 self._resolve_model(spec.preferred_model),
@@ -170,8 +171,9 @@ class LLMIntegrationManager:
             )
             raise LLMIntegrationError(f"LLM call failed for spec '{spec_key}': {exc}") from exc
 
+        latency = time.perf_counter() - start
         LOG.info(
-            "LLM call completed", extra={"spec": spec_key, "latency_s": result.duration}
+            "LLM call completed", extra={"spec": spec_key, "latency_s": latency}
         )
         return LLMInvocation(spec=spec, result=result)
 

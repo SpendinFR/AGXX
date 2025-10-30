@@ -1108,6 +1108,22 @@ class Orchestrator:
             job_manager = existing_jobs
 
         self.job_manager = job_manager
+        try:
+            self.telemetry.bind_job_manager(job_manager)
+        except Exception:
+            pass
+        arch_tm = getattr(self.arch, "telemetry", None)
+        if arch_tm is not None and hasattr(arch_tm, "bind_job_manager"):
+            try:
+                arch_tm.bind_job_manager(job_manager)
+            except Exception:
+                pass
+        arch_goals = getattr(self.arch, "goals", None)
+        if arch_goals is not None and hasattr(arch_goals, "bind_job_manager"):
+            try:
+                arch_goals.bind_job_manager(job_manager)
+            except Exception:
+                pass
         self._phenomenal_kernel = PhenomenalKernel()
         self.phenomenal_journal = getattr(self, "phenomenal_journal", None) or PhenomenalJournal()
         self.phenomenal_recall = getattr(self, "phenomenal_recall", None) or PhenomenalRecall(
@@ -2212,14 +2228,24 @@ class Orchestrator:
 
     # --- Cycle principal ----------------------------------------------------
     def run_once_cycle(self, user_msg: Optional[str] = None) -> List[Dict[str, Any]]:
-        try:
-            prioritizer = getattr(self.arch, "prioritizer", None)
-            if prioritizer is not None:
-                prioritizer.reprioritize_all()
-        except Exception:
-            pass
-
         jm = getattr(self, "job_manager", None)
+
+        skip_reprioritize = False
+        if user_msg:
+            skip_reprioritize = True
+        elif jm and jm.has_urgent():
+            skip_reprioritize = True
+        elif self._has_pending_urgent_trigger():
+            skip_reprioritize = True
+
+        if not skip_reprioritize:
+            try:
+                prioritizer = getattr(self.arch, "prioritizer", None)
+                if prioritizer is not None:
+                    prioritizer.reprioritize_all()
+            except Exception:
+                pass
+
         preemptive_urgent = False
         if jm:
             if user_msg:

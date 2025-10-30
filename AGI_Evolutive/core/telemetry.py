@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import threading
 import time
 from collections import deque
 from typing import Optional
@@ -17,6 +18,8 @@ class Telemetry:
         self.events = deque(maxlen=maxlen)
         self._jsonl_path = None
         self._console = False
+        self._job_manager = None
+        self._annotation_lock = threading.Lock()
 
     def enable_jsonl(self, path="logs/events.jsonl"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -24,6 +27,11 @@ class Telemetry:
 
     def enable_console(self, on=True):
         self._console = bool(on)
+
+    def bind_job_manager(self, job_manager) -> None:
+        """Bind a job manager so annotations can be deferred when urgent."""
+
+        self._job_manager = job_manager
 
     def log(self, event_type, subsystem, data=None, level="info"):
         e = {
@@ -33,11 +41,22 @@ class Telemetry:
             "level": level,
             "data": data or {}
         }
-        try:
-            annotation = self._llm_annotate(e)
-        except Exception as exc:  # pragma: no cover - defensive guard
-            LOGGER.debug("LLM annotation failed: %s", exc, exc_info=True)
-            annotation = None
+        annotation = None
+        jm = getattr(self, "_job_manager", None)
+        defer_annotation = False
+        if jm is not None:
+            try:
+                defer_annotation = bool(jm.has_urgent())
+                if not defer_annotation and hasattr(jm, "has_urgent_context"):
+                    defer_annotation = bool(jm.has_urgent_context())
+            except Exception:
+                defer_annotation = False
+        if not defer_annotation:
+            try:
+                annotation = self._llm_annotate(e)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                LOGGER.debug("LLM annotation failed: %s", exc, exc_info=True)
+                annotation = None
         if annotation:
             e["llm_annotation"] = annotation
         self.events.append(e)
@@ -48,6 +67,8 @@ class Telemetry:
                     f.write(json.dumps(json_sanitize(e), ensure_ascii=False) + "\n")
             except Exception:
                 pass
+        if defer_annotation:
+            self._enqueue_annotation(e)
         # console légère
         if self._console and level in ("info", "warn", "error"):
             ts = time.strftime("%H:%M:%S", time.localtime(e["ts"]))
@@ -84,3 +105,56 @@ class Telemetry:
             "routine": bool(response.get("routine", False)),
             "notes": response.get("notes", ""),
         }
+
+    # ------------------------------------------------------------------
+    # Deferred annotation handling
+    def _enqueue_annotation(self, event: dict) -> None:
+        jm = getattr(self, "_job_manager", None)
+        if jm is None:
+            return
+        try:
+            jm.submit(
+                kind="telemetry_annotation",
+                fn=self._annotation_job,
+                args={"event": event},
+                queue="background",
+                priority=0.35,
+                urgent=False,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.debug("Failed to enqueue telemetry annotation: %s", exc, exc_info=True)
+
+    def _annotation_job(self, ctx, args):
+        event = args.get("event") if isinstance(args, dict) else None
+        if not isinstance(event, dict):
+            return None
+        try:
+            annotation = self._llm_annotate(event)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            LOGGER.debug("Deferred telemetry annotation failed: %s", exc, exc_info=True)
+            return None
+        if annotation:
+            self._attach_annotation(event, annotation)
+        return annotation
+
+    def _attach_annotation(self, event: dict, annotation: dict) -> None:
+        with self._annotation_lock:
+            event["llm_annotation"] = annotation
+            path = self._jsonl_path
+            if not path:
+                return
+            payload = {
+                "ts": time.time(),
+                "type": "telemetry_annotation_update",
+                "subsystem": event.get("subsystem"),
+                "level": event.get("level"),
+                "data": {
+                    "event_ts": event.get("ts"),
+                    "annotation": json_sanitize(annotation),
+                },
+            }
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(json_sanitize(payload), ensure_ascii=False) + "\n")
+            except Exception:
+                pass

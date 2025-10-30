@@ -183,6 +183,7 @@ class JobManager:
         self._urgent_context = 0
         self._urgent_thread_counts: Dict[int, int] = {}
         self._urgent_local = threading.local()
+        self._pause_cond = threading.Condition(self._lock)
 
         # Démarre les workers
         self._alive = True
@@ -408,14 +409,20 @@ class JobManager:
                 self._urgent_thread_counts[ident] = count - 1
 
     def enter_urgent_context(self) -> None:
+        prior_depth = getattr(self._urgent_local, "depth", 0)
         self._mark_thread_urgent()
         with self._lock:
             self._urgent_context += 1
+            if self._urgent_context == 1 and prior_depth == 0:
+                while self._nonurgent_running_locked() > 0:
+                    self._pause_cond.wait(timeout=0.1)
 
     def exit_urgent_context(self) -> None:
         self._unmark_thread_urgent()
         with self._lock:
             self._urgent_context = max(0, self._urgent_context - 1)
+            if self._urgent_context == 0:
+                self._pause_cond.notify_all()
 
     def has_urgent_context(self) -> bool:
         with self._lock:
@@ -435,6 +442,11 @@ class JobManager:
                 or self._running_urgent > 0
                 or bool(self._pq_urgent)
             )
+
+    def _nonurgent_running_locked(self) -> int:
+        inter_nonurgent = max(0, self._running_inter - self._running_urgent)
+        back = max(0, self._running_back)
+        return inter_nonurgent + back
 
     @contextmanager
     def urgent_section(self):
@@ -603,6 +615,7 @@ class JobManager:
                 self._running_inter = max(0, self._running_inter - 1)
             else:
                 self._running_back = max(0, self._running_back - 1)
+            self._pause_cond.notify_all()
         reward, latency = self._compute_reward(j)
         success_flag = 1.0 if j.status == "done" else 0.0
         j.metrics.update(

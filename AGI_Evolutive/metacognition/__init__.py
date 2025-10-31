@@ -19,7 +19,11 @@ import inspect
 import re
 
 from AGI_Evolutive.cognition.meta_cognition import OnlineLinear
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import (
+    is_urgent_active,
+    try_call_llm_dict,
+    wait_for_urgent_clear,
+)
 
 from .experimentation import MetacognitionExperimenter, calibrate_self_model
 
@@ -601,6 +605,8 @@ class MetacognitiveSystem:
         def monitoring_loop():
             while self.running:
                 try:
+                    if is_urgent_active():
+                        wait_for_urgent_clear(timeout=30.0)
                     reasoning = self._get_reasoning_system()
                     if reasoning is None:
                         time.sleep(1)
@@ -626,6 +632,8 @@ class MetacognitiveSystem:
         def update_loop():
             while self.running:
                 try:
+                    if is_urgent_active():
+                        wait_for_urgent_clear(timeout=30.0)
                     self._update_self_model()
                     time.sleep(self.self_model_update_interval)
                 except Exception as e:

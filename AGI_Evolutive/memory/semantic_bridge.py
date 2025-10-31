@@ -9,7 +9,12 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-from AGI_Evolutive.utils.llm_service import LLMPreempted, try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import (
+    LLMPreempted,
+    is_urgent_active,
+    try_call_llm_dict,
+    wait_for_urgent_clear,
+)
 
 
 class SemanticMemoryBridge:
@@ -85,6 +90,8 @@ class SemanticMemoryBridge:
     def _process_batch(self, batch: Sequence[Mapping[str, Any]]) -> None:
         if not batch:
             return
+        if is_urgent_active():
+            wait_for_urgent_clear(timeout=30.0)
         try:
             memories = list(batch)
             lock = self._lock if self._lock is not None else nullcontext()

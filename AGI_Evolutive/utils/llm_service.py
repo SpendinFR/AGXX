@@ -85,6 +85,46 @@ _ACTIVE_LLM_CALLS_LOCK = threading.Lock()
 _ACTIVE_LLM_CALLS: dict[int, dict[str, Any]] = {}
 
 
+def _get_job_manager_for_background_wait() -> Optional[Any]:
+    """Return the bound job manager if background workers should pause."""
+
+    try:
+        return _get_bound_job_manager()
+    except Exception:
+        return None
+
+
+def wait_for_urgent_clear(timeout: Optional[float] = None) -> bool:
+    """Block until the urgent lane is clear or the timeout expires.
+
+    Background threads (memory, metacognition, etc.) can call this helper to
+    gracefully yield while interactive work is pending. It delegates to the
+    shared job manager when available and returns ``True`` if the wait ended
+    because the urgent window cleared (``False`` if the timeout elapsed or no
+    job manager is bound).
+    """
+
+    job_manager = _get_job_manager_for_background_wait()
+    if job_manager is None:
+        return False
+    try:
+        return bool(job_manager.wait_for_urgent_clear(timeout=timeout))
+    except Exception:
+        return False
+
+
+def is_urgent_active() -> bool:
+    """Check whether an urgent context is currently active."""
+
+    job_manager = _get_job_manager_for_background_wait()
+    if job_manager is None:
+        return False
+    try:
+        return bool(job_manager.has_urgent() or job_manager.has_urgent_context())
+    except Exception:
+        return False
+
+
 def _record_activity(spec_key: str, status: str, message: Optional[str] = None) -> None:
     try:
         _ACTIVITY_LOG.appendleft(
@@ -441,7 +481,9 @@ __all__ = [
     "get_llm_manager",
     "get_recent_llm_activity",
     "is_llm_enabled",
+    "is_urgent_active",
     "preempt_background_llm_calls",
     "set_llm_manager",
     "try_call_llm_dict",
+    "wait_for_urgent_clear",
 ]

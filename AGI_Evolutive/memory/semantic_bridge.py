@@ -4,12 +4,18 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from contextlib import nullcontext
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 LOGGER = logging.getLogger(__name__)
 
-from AGI_Evolutive.utils.llm_service import LLMPreempted, try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import (
+    LLMPreempted,
+    is_urgent_active,
+    try_call_llm_dict,
+    wait_for_urgent_clear,
+)
 
 
 class SemanticMemoryBridge:
@@ -85,6 +91,22 @@ class SemanticMemoryBridge:
     def _process_batch(self, batch: Sequence[Mapping[str, Any]]) -> None:
         if not batch:
             return
+        if is_urgent_active():
+            while not self._stop.is_set() and is_urgent_active():
+                cleared = wait_for_urgent_clear(timeout=1.0)
+                if cleared or not is_urgent_active():
+                    break
+                time.sleep(0.2)
+            if self._stop.is_set() and batch:
+                for item in reversed(list(batch)):
+                    try:
+                        self._queue.put_nowait(item)
+                    except queue.Full:
+                        LOGGER.debug(
+                            "Semantic bridge queue full while requeueing before shutdown"
+                        )
+                        break
+                return
         try:
             memories = list(batch)
             lock = self._lock if self._lock is not None else nullcontext()

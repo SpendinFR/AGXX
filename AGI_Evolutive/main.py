@@ -6,11 +6,13 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 import unicodedata
+from collections import deque
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict, get_recent_llm_activity
 
@@ -157,6 +159,216 @@ _NEGATIVE_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     ("critique", re.compile(r"\b(?:naime pas|naimeplus|deteste|horrible)\b")),
     ("cest_nul", re.compile(r"\bc\s*est\s+(?:pas\s+)?(?:terrible|nul|faux|mauvais|decevant)\b")),
 )
+
+
+def _extract_feedback_from_analysis(analysis: Dict[str, Any]) -> Tuple[Optional[str], float, Dict[str, Any]]:
+    meta = dict(analysis or {})
+    sentiment_norm = _normalize_feedback_text(str(meta.get("sentiment") or ""))
+    label: Optional[str] = None
+    if sentiment_norm:
+        if any(
+            word in sentiment_norm
+            for word in (
+                "positif",
+                "satisfait",
+                "content",
+                "heureux",
+                "ravi",
+                "merci",
+            )
+        ):
+            label = "positive"
+        elif any(
+            word in sentiment_norm
+            for word in (
+                "negatif",
+                "mecontent",
+                "insatisfait",
+                "colere",
+                "frustre",
+                "plainte",
+                "critique",
+            )
+        ):
+            label = "negative"
+    confidence = 0.7 if label else 0.0
+    urgency_level = str(meta.get("urgency") or "").lower()
+    if label and urgency_level == "haut":
+        confidence = max(confidence, 0.85)
+    elif label and urgency_level == "bas":
+        confidence = max(0.2, confidence * 0.9)
+    return label, float(confidence), meta
+
+
+def _apply_feedback_signal(
+    *,
+    label: Optional[str],
+    confidence: float,
+    meta: Dict[str, Any],
+    msg: str,
+    voice: Any,
+    concept_extractor: ConceptExtractor,
+    prefs: PreferencesAdapter,
+    arch: Any,
+) -> None:
+    if label not in {"positive", "negative"}:
+        return
+
+    confidence = max(0.0, min(1.0, float(confidence or 0.0)))
+
+    if label == "positive":
+        try:
+            voice.update_from_feedback(msg, positive=True)
+        except Exception:
+            pass
+    elif label == "negative":
+        try:
+            voice.update_from_feedback(msg, positive=False)
+        except Exception:
+            pass
+
+    try:
+        sign = 1 if label == "positive" else -1
+        raw_concepts = concept_extractor._extract_concepts(msg) or []
+        targets = [
+            str(c).strip().lower()
+            for c in raw_concepts
+            if c and len(str(c).strip()) >= 3
+        ][:5]
+        if targets:
+            evidence_id = f"user:{int(time.time())}"
+            base_strength = 1.0 if sign > 0 else 0.8
+            strength = max(0.3, base_strength * (0.6 + 0.4 * confidence))
+            for concept in targets:
+                prefs.observe_feedback(
+                    concept=concept,
+                    sign=sign,
+                    evidence_id=evidence_id,
+                    strength=strength,
+                )
+
+        selector = getattr(arch, "tactic_selector", None)
+        if selector and hasattr(selector, "feedback"):
+            try:
+                arm = getattr(arch, "_last_macro", None)
+                reward = confidence if sign > 0 else -confidence
+                if reward:
+                    selector.feedback(reward, arm=arm)
+            except Exception:
+                pass
+
+        qm_for_feedback = None
+        if hasattr(arch, "voice_profile"):
+            qm_for_feedback = getattr(arch.voice_profile, "quote_memory", None)
+        if qm_for_feedback is None:
+            qm_for_feedback = getattr(arch, "quote_memory", None)
+        if qm_for_feedback and confidence:
+            try:
+                reward = confidence if sign > 0 else -confidence
+                if reward:
+                    qm_for_feedback.reward_last(reward)
+                    qm_for_feedback.save()
+            except Exception:
+                pass
+
+        pack = getattr(arch, "_last_candidates", None)
+        if pack and isinstance(pack, dict) and pack.get("alts"):
+            try:
+                ctx_for_rank: Dict[str, Any] = {}
+                vp = getattr(arch, "voice_profile", None)
+                style_policy = getattr(vp, "style_policy", None)
+                if style_policy and hasattr(style_policy, "params"):
+                    ctx_for_rank["style"] = style_policy.params
+                ranker = getattr(arch, "ranker", None)
+                if ranker and hasattr(ranker, "update_pair"):
+                    winner = (pack.get("chosen") or {}).get("text") or pack.get("text")
+                    alts = pack.get("alts") or []
+                    loser = None
+                    if alts:
+                        loser = (
+                            (alts[0] or {}).get("text")
+                            if isinstance(alts[0], dict)
+                            else None
+                        )
+                    if winner and loser:
+                        lr_scale = max(0.2, min(1.0, confidence))
+                        if sign > 0:
+                            ranker.update_pair(
+                                ctx_for_rank,
+                                winner,
+                                loser,
+                                lr=0.15 * lr_scale,
+                            )
+                            if hasattr(ranker, "save"):
+                                ranker.save()
+                        else:
+                            ranker.update_pair(
+                                ctx_for_rank,
+                                loser,
+                                winner,
+                                lr=0.10 * lr_scale,
+                            )
+                            if hasattr(ranker, "save"):
+                                ranker.save()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _launch_cli_feedback_analysis(
+    adapter: "CLIAdaptiveFeedback",
+    msg: str,
+    base_label: Optional[str],
+    base_confidence: float,
+    pending: Deque[Dict[str, Any]],
+) -> None:
+    def _worker():
+        try:
+            analysis = adapter.analyze_with_llm(msg)
+        except Exception:
+            analysis = None
+        if analysis:
+            pending.append(
+                {
+                    "analysis": analysis,
+                    "text": msg,
+                    "base_label": base_label,
+                    "base_confidence": base_confidence,
+                }
+            )
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _drain_cli_feedback_results(
+    pending: Deque[Dict[str, Any]],
+    *,
+    voice: Any,
+    concept_extractor: ConceptExtractor,
+    prefs: PreferencesAdapter,
+    arch: Any,
+) -> None:
+    while pending:
+        payload = pending.popleft()
+        analysis = payload.get("analysis") or {}
+        msg = str(payload.get("text") or "")
+        base_label = payload.get("base_label")
+        label, confidence, meta = _extract_feedback_from_analysis(analysis)
+        if not label:
+            continue
+        if base_label and label == base_label:
+            continue
+        _apply_feedback_signal(
+            label=label,
+            confidence=confidence,
+            meta=meta,
+            msg=msg,
+            voice=voice,
+            concept_extractor=concept_extractor,
+            prefs=prefs,
+            arch=arch,
+        )
 
 _POSITIVE_EMOJI_RE = re.compile(r"[👍👏🙏😊😁😄😍🤩❤♥️💖💙💚💛💜💗]")
 _NEGATIVE_EMOJI_RE = re.compile(r"[😞😠😡☹🙁😤😒😕😔😩😫😢😭👎]")
@@ -460,9 +672,18 @@ def run_cli(*, disable_llm: bool = False):
 
     _last_view: List[Dict[str, Any]] = []
     _pending_cache: List[Dict[str, Any]] = []
+    _pending_feedback_results: Deque[Dict[str, Any]] = deque()
 
     while True:
         try:
+            _drain_cli_feedback_results(
+                _pending_feedback_results,
+                voice=voice,
+                concept_extractor=concept_extractor,
+                prefs=prefs,
+                arch=arch,
+            )
+
             # Affiche jusqu'à 3 questions en attente à chaque itération
             try:
                 qm = _get_qm(auto)
@@ -845,22 +1066,6 @@ def run_cli(*, disable_llm: bool = False):
         feedback_label: Optional[str] = None
         feedback_confidence = 0.0
         feedback_meta: Dict[str, Any] = {}
-        llm_label: Optional[str] = None
-        llm_confidence = 0.0
-
-        llm_analysis = feedback_adapter.analyze_with_llm(msg)
-        if llm_analysis:
-            feedback_meta = dict(llm_analysis)
-            sentiment_norm = _normalize_feedback_text(str(llm_analysis.get("sentiment") or ""))
-            if sentiment_norm:
-                if any(word in sentiment_norm for word in ("positif", "satisfait", "content", "heureux", "ravi", "merci")):
-                    llm_label = "positive"
-                elif any(word in sentiment_norm for word in ("negatif", "mecontent", "insatisfait", "colere", "frustre", "plainte", "critique")):
-                    llm_label = "negative"
-            if llm_label:
-                llm_confidence = 0.7
-                feedback_label = llm_label
-                feedback_confidence = llm_confidence
 
         heur_label, heur_pattern = _detect_feedback_label(msg)
         if heur_label:
@@ -874,100 +1079,17 @@ def run_cli(*, disable_llm: bool = False):
                 feedback_confidence = prediction["confidence"]
                 feedback_adapter.record_prediction(prediction["label"], prediction["confidence"])
 
-        if llm_label:
-            if feedback_label is None:
-                feedback_label = llm_label
-                feedback_confidence = llm_confidence
-            elif feedback_label == llm_label:
-                feedback_confidence = max(feedback_confidence, max(llm_confidence, 0.75))
-            else:
-                feedback_confidence *= 0.6
-
-        urgency_level = str(feedback_meta.get("urgency") or "").lower()
-        if feedback_label and urgency_level == "haut":
-            feedback_confidence = max(feedback_confidence, 0.85)
-        elif feedback_label and urgency_level == "bas":
-            feedback_confidence = max(0.2, feedback_confidence * 0.9)
-
-        if feedback_label == "positive":
-            voice.update_from_feedback(msg, positive=True)
-        elif feedback_label == "negative":
-            voice.update_from_feedback(msg, positive=False)
-
-        try:
-            pos = feedback_label == "positive"
-            neg = feedback_label == "negative"
-            if pos or neg:
-                sign = 1 if pos else -1
-                raw_concepts = concept_extractor._extract_concepts(msg) or []
-                targets = [str(c).strip().lower() for c in raw_concepts if c and len(str(c)) >= 3][:5]
-                if targets:
-                    evidence_id = f"user:{int(time.time())}"
-                    base_strength = 1.0 if sign > 0 else 0.8
-                    strength = max(0.3, base_strength * (0.6 + 0.4 * feedback_confidence))
-                    for c in targets:
-                        prefs.observe_feedback(
-                            concept=c,
-                            sign=sign,
-                            evidence_id=evidence_id,
-                            strength=strength,
-                        )
-
-                selector = getattr(arch, "tactic_selector", None)
-                if selector and hasattr(selector, "feedback"):
-                    try:
-                        arm = getattr(arch, "_last_macro", None)
-                        reward = feedback_confidence if pos else -feedback_confidence
-                        if reward > 0:
-                            selector.feedback(reward, arm=arm)
-                        elif reward < 0:
-                            selector.feedback(reward, arm=arm)
-                    except Exception:
-                        pass
-
-                qm_for_feedback = None
-                if hasattr(arch, "voice_profile"):
-                    qm_for_feedback = getattr(arch.voice_profile, "quote_memory", None)
-                if qm_for_feedback is None:
-                    qm_for_feedback = getattr(arch, "quote_memory", None)
-                if qm_for_feedback:
-                    try:
-                        reward = feedback_confidence if pos else -feedback_confidence
-                        if reward:
-                            qm_for_feedback.reward_last(reward)
-                            qm_for_feedback.save()
-                    except Exception:
-                        pass
-
-                pack = getattr(arch, "_last_candidates", None)
-                if pack and isinstance(pack, dict) and pack.get("alts"):
-                    try:
-                        ctx_for_rank = {}
-                        vp = getattr(arch, "voice_profile", None)
-                        style_policy = getattr(vp, "style_policy", None)
-                        if style_policy and hasattr(style_policy, "params"):
-                            ctx_for_rank["style"] = style_policy.params
-                        ranker = getattr(arch, "ranker", None)
-                        if ranker and hasattr(ranker, "update_pair"):
-                            winner = (pack.get("chosen") or {}).get("text") or pack.get("text")
-                            alts = pack.get("alts") or []
-                            loser = None
-                            if alts:
-                                loser = (alts[0] or {}).get("text") if isinstance(alts[0], dict) else None
-                            if winner and loser:
-                                lr_scale = max(0.2, min(1.0, feedback_confidence))
-                                if pos:
-                                    ranker.update_pair(ctx_for_rank, winner, loser, lr=0.15 * lr_scale)
-                                    if hasattr(ranker, "save"):
-                                        ranker.save()
-                                elif neg:
-                                    ranker.update_pair(ctx_for_rank, loser, winner, lr=0.10 * lr_scale)
-                                    if hasattr(ranker, "save"):
-                                        ranker.save()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        if feedback_label:
+            _apply_feedback_signal(
+                label=feedback_label,
+                confidence=feedback_confidence,
+                meta=feedback_meta,
+                msg=msg,
+                voice=voice,
+                concept_extractor=concept_extractor,
+                prefs=prefs,
+                arch=arch,
+            )
 
         assistant_text_override: Optional[str] = None
         final_pack_override: Optional[Dict[str, Any]] = None
@@ -1010,6 +1132,14 @@ def run_cli(*, disable_llm: bool = False):
                 assistant_text_brut = {"text": fallback_reply}
         else:
             assistant_text_brut = None
+
+        _launch_cli_feedback_analysis(
+            feedback_adapter,
+            msg,
+            feedback_label,
+            feedback_confidence,
+            _pending_feedback_results,
+        )
 
         semantic_source = (
             assistant_text_override if assistant_text_override is not None else assistant_text_brut

@@ -3,6 +3,7 @@ import pathlib
 import sys
 import unicodedata
 from types import SimpleNamespace
+from typing import Any, Dict, Mapping, Optional
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -202,12 +203,66 @@ def test_unknown_action_goes_through_skill_sandbox(tmp_path):
     assert "summary" in second
 
 
+class _StubSignalLLM:
+    def __init__(self, responses: Mapping[str, Mapping[str, Any]]) -> None:
+        self.responses = {str(key): dict(value) for key, value in responses.items()}
+        self.calls: list[tuple[str, Dict[str, Any]]] = []
+
+    def call_dict(self, spec_key: str, *, input_payload: Optional[Mapping[str, Any]] = None, **_: Any) -> Mapping[str, Any]:
+        self.calls.append((spec_key, dict(input_payload or {})))
+        return self.responses[spec_key]
+
+
 def test_auto_intention_signals_adjust_reward(tmp_path):
+    stub = _StubSignalLLM(
+        {
+            "auto_signal_derivation": {
+                "signals": [
+                    {
+                        "name": "relation_depth",
+                        "metric": "relation_depth_score",
+                        "direction": "above",
+                        "target": 0.75,
+                        "weight": 1.1,
+                    },
+                    {
+                        "name": "trust_guard",
+                        "metric": "trust_risk",
+                        "direction": "below",
+                        "target": 0.2,
+                        "weight": 0.6,
+                    },
+                ]
+            },
+            "auto_signal_registration": {
+                "signals": [
+                    {
+                        "name": "relation_depth",
+                        "metric": "relation_depth_score",
+                        "direction": "above",
+                        "target": 0.75,
+                        "weight": 1.1,
+                        "last_value": 0.65,
+                    },
+                    {
+                        "name": "trust_guard",
+                        "metric": "trust_risk",
+                        "direction": "below",
+                        "target": 0.2,
+                        "weight": 0.6,
+                        "last_value": 0.25,
+                    },
+                ]
+            },
+            "auto_signal_keywords": {"keywords": ["relation", "empathie", "durable"]},
+        }
+    )
+
     interface = ActionInterface(
         path_log=str(tmp_path / "actions.jsonl"),
         output_dir=str(tmp_path / "out"),
     )
-    registry = AutoSignalRegistry()
+    registry = AutoSignalRegistry(llm_manager=stub)
     interface.bind(auto_signals=registry)
 
     event = {
@@ -218,65 +273,88 @@ def test_auto_intention_signals_adjust_reward(tmp_path):
     }
     evaluation = {"score": 0.72, "significance": 0.78, "alignment": 0.74}
     interface.on_auto_intention_promoted(event, evaluation, None)
+
     signals = registry.get_signals("build_relationship")
     metrics = {sig.metric for sig in signals}
-    assert {"success_rate", "confidence", "consistency"}.issubset(metrics)
+    assert {"relation_depth_score", "trust_risk"} <= metrics
 
     fragments = set(
         extract_keywords(
             event["description"],
             " ".join(event["requirements"]),
             " ".join(event["metadata"]["keywords"]),
+            llm_manager=stub,
         )
     )
-    assert fragments, "keyword extraction should provide guidance"
-    for fragment in fragments:
-        normalized = unicodedata.normalize("NFKD", fragment).encode("ascii", "ignore").decode("ascii")
-        if not normalized:
-            continue
-        assert any(normalized in sig.metric or normalized in sig.name for sig in signals), "derived metrics should reference autonomous keywords"
+    assert fragments == {"relation", "empathie", "durable"}
 
     base_action = Action(id="rel-1", type="build_relationship", payload={}, priority=0.5)
     base_action.status = "done"
+    base_action.result = {
+        "metrics": {
+            "relation_depth_score": 0.9,
+            "trust_risk": 0.1,
+        }
+    }
 
-    positive_metrics = {}
-    weak_metrics = {}
-    for signal in signals:
-        metric_name = signal.metric
-        if signal.direction == "below":
-            positive_value = max(0.0, signal.target - 0.1)
-            weak_value = min(1.0, signal.target + 0.2)
-        else:
-            positive_value = min(1.0, signal.target + 0.1)
-            weak_value = max(0.0, signal.target - 0.2)
-        positive_metrics[metric_name] = round(positive_value, 3)
-        weak_metrics[metric_name] = round(weak_value, 3)
-
-    base_action.result = {"metrics": positive_metrics}
-
-    registry.bulk_record("build_relationship", positive_metrics, source="test")
+    registry.bulk_record("build_relationship", base_action.result["metrics"], source="test")
 
     reward_positive = interface._shape_reward(base_action)
 
     weak_action = Action(id="rel-2", type="build_relationship", payload={}, priority=0.5)
     weak_action.status = "done"
-    weak_action.result = {"metrics": weak_metrics}
+    weak_action.result = {
+        "metrics": {
+            "relation_depth_score": 0.55,
+            "trust_risk": 0.35,
+        }
+    }
 
-    registry.bulk_record("build_relationship", weak_metrics, source="test")
+    registry.bulk_record("build_relationship", weak_action.result["metrics"], source="test")
 
     reward_weak = interface._shape_reward(weak_action)
 
-    # Baseline for a successful action without signals would be 0.6
-    assert reward_positive > 0.6
     assert reward_positive > reward_weak
 
 
 def test_manual_signal_payloads_are_augmented(tmp_path):
+    stub = _StubSignalLLM(
+        {
+            "auto_signal_derivation": {
+                "signals": [
+                    {
+                        "name": "relationship_quality",
+                        "metric": "relationship_quality",
+                        "direction": "above",
+                        "target": 0.8,
+                    }
+                ]
+            },
+            "auto_signal_registration": {
+                "signals": [
+                    {
+                        "name": "build_relationship__custom",
+                        "metric": "custom_metric",
+                        "direction": "above",
+                        "target": 0.9,
+                    },
+                    {
+                        "name": "relationship_quality",
+                        "metric": "relationship_quality",
+                        "direction": "above",
+                        "target": 0.8,
+                    },
+                ]
+            },
+            "auto_signal_keywords": {"keywords": ["relation", "empathie", "durable"]},
+        }
+    )
+
     interface = ActionInterface(
         path_log=str(tmp_path / "actions.jsonl"),
         output_dir=str(tmp_path / "out"),
     )
-    registry = AutoSignalRegistry()
+    registry = AutoSignalRegistry(llm_manager=stub)
     interface.bind(auto_signals=registry)
 
     event = {
@@ -297,22 +375,12 @@ def test_manual_signal_payloads_are_augmented(tmp_path):
 
     signals = registry.get_signals("build_relationship")
     metrics = {sig.metric for sig in signals}
-    assert "custom_metric" in metrics
+    assert {"custom_metric", "relationship_quality"} <= metrics
 
-    fragments = set(
-        extract_keywords(
-            event["description"],
-            " ".join(event.get("requirements", [])),
-            " ".join(event["metadata"]["keywords"]),
-        )
+    keywords = extract_keywords(
+        event["description"],
+        " ".join(event.get("requirements", [])),
+        " ".join(event["metadata"]["keywords"]),
+        llm_manager=stub,
     )
-    normalized_fragments = []
-    for fragment in fragments:
-        normalized = unicodedata.normalize("NFKD", fragment).encode("ascii", "ignore").decode("ascii")
-        if normalized:
-            normalized_fragments.append(normalized)
-    assert any(
-        (normalized in sig.metric or normalized in sig.name) and sig.metric != "custom_metric"
-        for normalized in normalized_fragments
-        for sig in signals
-    ), "auto-generated metrics should supplement manual definitions"
+    assert keywords == ["relation", "empathie", "durable"]

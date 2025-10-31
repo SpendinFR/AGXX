@@ -1343,113 +1343,220 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
     _spec(
         "social_interaction_miner",
         "AGI_Evolutive/social/interaction_miner.py",
-        "Décrypte l'acte de parole et suggère des règles sociales.",
-        AVAILABLE_MODELS["fast"],
-        extra_instructions=("Inclue un champ 'expected_effect' pour chaque règle.",),
+        "Analyse un échange et propose des règles sociales structurées.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Retourne la clé 'rules' avec une liste de règles triées par pertinence.",
+            "Chaque règle doit inclure 'id', 'title', 'tactic', 'predicates', 'confidence' et 'rationale'.",
+            "Limite les paramètres de tactique à ceux nécessaires et fournis-les dans 'params'.",
+        ),
         example_output={
-            "speech_act": "demande_d'assistance",
-            "confidence": 0.82,
-            "suggested_rules": [
-                {"rule": "offrir_aide", "expected_effect": "renforcer la confiance"}
+            "rules": [
+                {
+                    "id": "rule:clarify_need",
+                    "title": "Clarifier le besoin exprimé",
+                    "tactic": {"name": "clarification_dirigée", "params": {"ask_confirmation": True}},
+                    "predicates": [
+                        {"key": "dialogue_act", "operator": "eq", "value": "demande", "weight": 0.9},
+                        {"key": "risk_level", "operator": "in", "value": ["low", "medium"], "weight": 0.6},
+                    ],
+                    "confidence": 0.78,
+                    "rationale": "L'utilisateur sollicite un conseil concret sur un incident précis.",
+                }
             ],
-            "notes": "",
+            "notes": "Aucune règle contradictoire détectée.",
         },
     ),
     _spec(
         "social_adaptive_lexicon",
         "AGI_Evolutive/social/adaptive_lexicon.py",
-        "Repère les expressions saillantes et indique leur polarité sociale.",
+        "Centralise la détection et la mise à jour du lexique social.",
         AVAILABLE_MODELS["fast"],
         extra_instructions=(
-            "Limite-toi aux marqueurs réellement présents dans le message.",
-            "Retourne au plus 6 éléments classés par confiance décroissante.",
-            "Fourni une estimation 'reward_hint' ∈ [0,1] si le ton global est clair.",
+            "Le champ 'matched' indique si le message contient un marqueur saillant.",
+            "Retourne 'updates' pour toute nouvelle entrée à prioriser.",
+            "Fournis toujours un objet 'state' avec 'tokens' et 'dormant_tokens'.",
         ),
         example_output={
-            "markers": [
-                {
-                    "phrase": "merci infiniment",
-                    "polarity": "positive",
-                    "confidence": 0.82,
-                    "rationale": "Remerciement explicite",
-                },
-                {
-                    "phrase": "un peu déçu",
-                    "polarity": "negative",
-                    "confidence": 0.56,
-                    "rationale": "Expression directe de déception",
-                },
+            "matched": True,
+            "updates": [
+                {"phrase": "merci infiniment", "polarity": "positive", "confidence": 0.84}
             ],
-            "reward_hint": 0.74,
-            "notes": "Aucun sarcasme détecté.",
+            "state": {
+                "tokens": [
+                    {"phrase": "merci infiniment", "polarity": "positive", "confidence": 0.84},
+                    {"phrase": "c'est top", "polarity": "positive", "confidence": 0.71},
+                ],
+                "dormant_tokens": [
+                    {"phrase": "pas terrible", "polarity": "negative", "confidence": 0.52}
+                ],
+                "metadata": {"updated_at": "2024-07-12T09:30:00Z"},
+            },
+            "notes": "Tonalité chaleureuse, pas de sarcasme détecté.",
         },
     ),
     _spec(
         "social_interaction_context",
         "AGI_Evolutive/social/interaction_rule.py",
-        "Analyse le dernier échange et affine le contexte symbolique social.",
+        "Synthétise le contexte conversationnel avant sélection tactique.",
         AVAILABLE_MODELS["fast"],
         extra_instructions=(
-            "Retourne un objet 'context' avec les clés détectées.",
-            "Ajoute 'topics' si tu peux inférer des thèmes prioritaires.",
-            "Fournis 'confidence' global et 'notes' synthétiques.",
+            "Retourne un objet 'context' prêt à l'emploi pour le sélecteur.",
+            "Ajoute 'signals' pour les marqueurs détectés (risque, valence, intention).",
+            "Inclue 'topics' si pertinents et un champ 'confidence' global.",
         ),
         example_output={
+            "baseline": {"persona_id": "mentor_fr", "user_id": "alex"},
             "context": {
                 "dialogue_act": "demande_assistance",
-                "risk_level": "low",
-                "persona_alignment": 0.62,
+                "risk_level": "medium",
+                "persona_alignment": 0.64,
                 "implicature_hint": "sous-entendu",
-                "topics": ["incident api", "urgence"],
             },
-            "confidence": 0.76,
+            "signals": {"valence": 0.32, "engagement": 0.71},
+            "topics": ["incident API", "urgence"],
+            "confidence": 0.78,
             "notes": "Utilisateur inquiet mais collaboratif.",
         },
     ),
     _spec(
-        "social_critic_assessment",
+        "social_interaction_outcome",
         "AGI_Evolutive/social/social_critic.py",
-        "Évalue la réponse utilisateur et synthétise les signaux sociaux clés.",
+        "Estime le reward social d'un message utilisateur et les signaux associés.",
         AVAILABLE_MODELS["reasoning"],
         extra_instructions=(
-            "Retourne un objet 'signals' avec les mesures recommandées.",
-            "Déduis 'relationship_depth' et 'relationship_growth' ∈ [0,1].",
-            "Indique 'markers' pertinents si détectés.",
+            "Retourne 'reward' et 'confidence' entre 0 et 1.",
+            "Expose les indicateurs clefs dans 'signals' (reduced_uncertainty, continue_dialogue, valence, etc.).",
+            "Ajoute 'lexicon_updates' si des expressions doivent être renforcées.",
         ),
         example_output={
+            "reward": 0.74,
+            "confidence": 0.81,
             "signals": {
                 "reduced_uncertainty": True,
                 "continue_dialogue": True,
                 "valence": 0.35,
-                "acceptance": True,
-                "explicit_feedback": {"polarity": "positive", "confidence": 0.78},
-                "relationship_depth": 0.66,
-                "relationship_growth": 0.58,
-                "identity_consistency": 0.7,
+                "relationship_depth": 0.62,
             },
-            "reward_hint": 0.73,
-            "markers": [
-                {
-                    "phrase": "merci pour l'aide",
-                    "polarity": "positive",
-                    "confidence": 0.81,
-                }
+            "lexicon_updates": [
+                {"phrase": "merci pour ton aide", "polarity": "positive", "confidence": 0.79}
             ],
-            "confidence": 0.8,
             "notes": "Tonalité rassurée, attentes clarifiées.",
+        },
+    ),
+    _spec(
+        "social_conversation_analysis",
+        "AGI_Evolutive/social/social_critic.py",
+        "Fournit une analyse qualitative rapide d'un passage de conversation.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Ajoute un champ 'summary' en français clair.",
+            "Liste 'risks' et 'opportunities' si détectés.",
+            "Retourne 'recommended_actions' si une intervention est suggérée.",
+        ),
+        example_output={
+            "summary": "L'utilisateur remercie et souhaite consolider la solution.",
+            "risks": ["perdre l'élan si pas de suivi"],
+            "opportunities": ["proposer un plan d'action concret"],
+            "recommended_actions": [
+                {"label": "proposer un récapitulatif", "priority": 0.7, "notes": "ancrer la confiance"}
+            ],
+            "notes": "",
+        },
+    ),
+    _spec(
+        "social_conversation_rewrite",
+        "AGI_Evolutive/social/social_critic.py",
+        "Réécrit un message pour l'aligner avec la stratégie sociale courante.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Retourne la version finale dans 'rewritten'.",
+            "Ajoute 'justification' pour expliquer les ajustements.",
+        ),
+        example_output={
+            "rewritten": "Merci pour ton retour, je m'assure de tout noter pour la suite.",
+            "justification": "Conserver le ton chaleureux tout en montrant la prise en compte.",
+        },
+    ),
+    _spec(
+        "social_rule_update",
+        "AGI_Evolutive/social/social_critic.py",
+        "Met à jour une règle sociale à partir d'un nouvel outcome.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Retourne un objet 'rule' complet avec les champs actualisés.",
+            "Décris les effets attendus dans 'notes' si pertinents.",
+        ),
+        example_output={
+            "rule": {
+                "id": "rule:clarify_need",
+                "title": "Clarifier le besoin exprimé",
+                "tactic": {"name": "clarification_dirigée", "params": {"ask_confirmation": True}},
+                "predicates": [
+                    {"key": "dialogue_act", "operator": "eq", "value": "demande", "weight": 0.9}
+                ],
+                "confidence": 0.81,
+                "rationale": "Récompense élevée observée sur les derniers échanges.",
+            },
+            "notes": "Mettre à jour la documentation utilisateur associée.",
+        },
+    ),
+    _spec(
+        "social_rule_self_evaluation",
+        "AGI_Evolutive/social/interaction_miner.py",
+        "Planifie la vérification d'une règle sociale récemment induite.",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Retourne 'actions' avec description et priorité pour la validation.",
+            "Ajoute 'notes' pour contextualiser si nécessaire.",
+        ),
+        example_output={
+            "actions": [
+                {"label": "simuler une conversation contradictoire", "priority": 0.66},
+                {"label": "consulter la mémoire pour contre-exemples", "priority": 0.52},
+            ],
+            "notes": "Prévoir un suivi après application réelle.",
+        },
+    ),
+    _spec(
+        "social_simulation_score",
+        "AGI_Evolutive/social/social_critic.py",
+        "Évalue une simulation sociale et retourne un score unique.",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Score ∈ [0,1] avec un 'rationale' synthétique.",
+            "Ajoute 'signals' si des observations clés émergent.",
+        ),
+        example_output={
+            "score": 0.58,
+            "rationale": "La variante avec clarification réduit les frictions perçues.",
+            "signals": {"relationship_depth": 0.61},
         },
     ),
     _spec(
         "social_tactic_selector",
         "AGI_Evolutive/social/tactic_selector.py",
-        "Évalue les tactiques sociales et anticipe leurs effets.",
+        "Choisit la tactique sociale prioritaire et explique la décision.",
         AVAILABLE_MODELS["reasoning"],
-        extra_instructions=("Donne un score utilité et risque pour chaque tactique.",),
+        extra_instructions=(
+            "Retourne 'selected_rule' avec la tactique retenue.",
+            "Ajoute 'meta' pour résumer les raisons (score, risques, opportunités).",
+        ),
         example_output={
-            "tactics": [
-                {"name": "empathic_acknowledgment", "utility": 0.78, "risk": 0.12, "explanation": "apaise la tension"}
-            ],
-            "notes": "",
+            "selected_rule": {
+                "id": "rule:clarify_need",
+                "title": "Clarifier le besoin exprimé",
+                "tactic": {"name": "clarification_dirigée", "params": {"ask_confirmation": True}},
+                "predicates": [
+                    {"key": "dialogue_act", "operator": "eq", "value": "demande", "weight": 0.9}
+                ],
+                "confidence": 0.82,
+            },
+            "meta": {
+                "utility": 0.79,
+                "risk": 0.18,
+                "rationale": "Permet de dissiper l'incertitude tout en restant chaleureux.",
+            },
         },
     ),
     _spec(
@@ -1531,14 +1638,174 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
     _spec(
         "autonomy_core",
         "AGI_Evolutive/autonomy/core.py",
-        "Propose des micro-actions adaptées au contexte d'autonomie.",
+        "Analyse le snapshot d'autonomie et retourne la décision complète (hypothèses, tests, preuves, action, feedback).",
         AVAILABLE_MODELS["reasoning"],
-        extra_instructions=("Associe chaque micro-action à une probabilité de succès.",),
+        extra_instructions=(
+            "Retourne `hypotheses` (≥1) avec pour chacune `content` et `prior` ∈ [0,1].",
+            "Retourne `tests` (≥1) avec `description`, `expected_information_gain` ∈ [0,1] et optionnellement `cost_est`.",
+            "Fournis `evidence` avec au minimum `notes` et `confidence` ∈ [0,1].",
+            "Structure `decision` avec `decision`, `reason`, `confidence` ∈ [0,1] et ajoute `policy_feedback` si utile.",
+            "Fixe `progress_step` (0-1), `final_confidence` (0-1) et un `result_text` synthétique.",
+            "Ajoute `metacognition_event` (`kind`, `details`) et `annotations`/`metadata` si des signaux doivent être transmis.",
+        ),
         example_output={
-            "micro_actions": [
-                {"name": "revue_memoire_incident", "success_probability": 0.7, "effort": "moyen"}
+            "hypotheses": [
+                {
+                    "content": "Reprendre l'objectif onboarding_utilisateur",
+                    "prior": 0.68,
+                }
             ],
-            "notes": "",
+            "tests": [
+                {
+                    "description": "Inspecter les derniers retours inbox",
+                    "expected_information_gain": 0.52,
+                    "cost_est": 0.15,
+                }
+            ],
+            "evidence": {
+                "notes": "L'utilisateur reste silencieux depuis 4h, risque de dérive sur l'agenda.",
+                "confidence": 0.61,
+            },
+            "decision": {
+                "decision": "relancer_utilisateur",
+                "reason": "Clarifier la priorité avant de poursuivre les tâches secondaires.",
+                "confidence": 0.66,
+                "policy_feedback": {
+                    "proposal": "relance_alignement",
+                    "success": True,
+                },
+            },
+            "progress_step": 0.12,
+            "final_confidence": 0.64,
+            "result_text": "Préparer une relance concise pour valider la priorité du jour.",
+            "metacognition_event": {
+                "kind": "reflection",
+                "details": "Signal faible sur l'alignement utilisateur, relance recommandée.",
+            },
+            "annotations": {"homeostasis_risk": "alignment_gap"},
+        },
+    ),
+    _spec(
+        "auto_evolution",
+        "AGI_Evolutive/autonomy/auto_evolution.py",
+        "Synthétise l'état d'auto-évolution et renvoie l'intention, son évaluation et les signaux associés.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Expose `accepted` (bool) pour indiquer si l'intention doit être promue immédiatement.",
+            "Décris `intention` avec `action_type`, `description`, `confidence` et `rationale`.",
+            "Retourne `evaluation` (score/global`, `risks`, `notes`) pour cadrer la décision.",
+            "Liste `signals` (0..n) avec `name`, `metric`, `direction` (above/below), `target`, `weight`, `source`, `metadata`.",
+            "Ajoute `follow_up` (liste de str) et `metadata` (mapping) pour le monitoring.",
+        ),
+        example_output={
+            "accepted": True,
+            "intention": {
+                "action_type": "code_refactor",
+                "description": "Nettoyer le module language/style_profiler pour adopter le contrat LLM.",
+                "confidence": 0.71,
+                "rationale": "Bloc legacy détecté, le LLM peut fournir une version unifiée.",
+            },
+            "evaluation": {
+                "score": 0.63,
+                "impact": "medium",
+                "risks": ["Risque de divergence stylistique sans validation"],
+                "notes": "Prévoir un contrôle sandbox après promotion.",
+            },
+            "signals": [
+                {
+                    "name": "style_profiler_accuracy",
+                    "metric": "style_profiler_accuracy",
+                    "direction": "above",
+                    "target": 0.8,
+                    "weight": 0.6,
+                    "source": "llm_auto_evolution",
+                    "metadata": {"window": "24h"},
+                }
+            ],
+            "follow_up": [
+                "Notifier l'équipe sandbox d'une future évaluation",
+                "Programmer une relance utilisateur post-refactor",
+            ],
+            "metadata": {
+                "confidence_interval": [0.55, 0.77],
+                "notes": "Aucun blocage dépendant de permissions externes",
+            },
+        },
+    ),
+    _spec(
+        "auto_signal_derivation",
+        "AGI_Evolutive/autonomy/auto_signals.py",
+        "Dérive les signaux candidats à partir d'une description d'action autonome.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Retourne `signals` (≥1) — chaque entrée doit inclure `name`, `metric`, `direction` (above/below), `target`, `weight` (0-1), `source` et `metadata`.",
+            "Inclue `notes` ou `considerations` si des hypothèses doivent être journalisées.",
+        ),
+        example_output={
+            "signals": [
+                {
+                    "name": "engagement_inbox",
+                    "metric": "engagement_inbox",
+                    "direction": "above",
+                    "target": 0.7,
+                    "weight": 0.5,
+                    "source": "llm_derivation",
+                    "metadata": {"window": "7d", "aggregation": "ema"},
+                },
+                {
+                    "name": "temps_reponse",
+                    "metric": "inbox_response_time",
+                    "direction": "below",
+                    "target": 1800,
+                    "weight": 0.4,
+                    "source": "llm_derivation",
+                    "metadata": {"unit": "seconds"},
+                },
+            ],
+            "notes": "Prioriser l'observation de la réactivité pour confirmer l'intérêt de l'intention.",
+        },
+    ),
+    _spec(
+        "auto_signal_registration",
+        "AGI_Evolutive/autonomy/auto_signals.py",
+        "Valide et complète les signaux retenus pour un type d'action donné.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Retourne `signals` (≥0) prêts à être suivis — mêmes champs qu'en dérivation (name, metric, direction, target, weight, source, metadata).",
+            "Ajoute si possible `last_value`, `last_source` et `last_updated` (timestamp) pour initialiser les observations.",
+            "Documente `warnings` ou `notes` lorsque l'enregistrement nécessite une attention spécifique.",
+        ),
+        example_output={
+            "signals": [
+                {
+                    "name": "style_profiler_accuracy",
+                    "metric": "style_profiler_accuracy",
+                    "direction": "above",
+                    "target": 0.82,
+                    "weight": 0.55,
+                    "source": "llm_registration",
+                    "metadata": {"aggregation": "ema", "window": "24h"},
+                    "last_value": 0.74,
+                    "last_source": "baseline_history",
+                    "last_updated": 1715606400,
+                }
+            ],
+            "notes": "Mettre en place une alerte si la métrique descend sous 0.6 pendant 48h.",
+        },
+    ),
+    _spec(
+        "auto_signal_keywords",
+        "AGI_Evolutive/autonomy/auto_signals.py",
+        "Extrait les mots-clés structurants pour décrire une intention autonome ou un rapport.",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Retourne `keywords` (liste de str uniques en minuscules).",
+            "Ajoute `confidence` (0-1) et `notes` si l'extraction est incertaine.",
+        ),
+        example_output={
+            "keywords": ["auto-evolution", "inbox", "priorisation"],
+            "confidence": 0.69,
+            "notes": "Faible signal sur l'aspect sandbox, à confirmer après exécution.",
         },
     ),
     _spec(
@@ -1711,18 +1978,75 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
         },
     ),
     _spec(
+        "belief_graph_orchestrator",
+        "AGI_Evolutive/beliefs/graph.py",
+        "Pilote les opérations du graphe de croyances (upsert, requêtes, feedback, événements).",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Analyse le champ 'operation' pour ajuster la réponse (ex: upsert_belief, query_beliefs, add_event, record_feedback).",
+            "Retourne toujours un objet 'result' décrivant l'issue et 'updates' listant les croyances/événements à intégrer ou retirer.",
+            "Pour un upsert, fournis 'result.belief_id' et la version normalisée dans 'updates.beliefs'.",
+            "Pour une requête, renvoie les croyances filtrées dans 'beliefs' et, si nécessaire, 'pairs' pour les contradictions détectées.",
+            "Ajoute un champ 'notes' lorsque des suivis humains sont recommandés.",
+        ),
+        example_output={
+            "result": {
+                "operation": "upsert_belief",
+                "belief_id": "belief:agent::pratique::rituel_pause",
+            },
+            "updates": {
+                "beliefs": [
+                    {
+                        "id": "belief:agent::pratique::rituel_pause",
+                        "subject": "agent",
+                        "relation": "pratique",
+                        "value": "rituel_pause",
+                        "confidence": 0.74,
+                        "polarity": 1,
+                        "created_by": "system",
+                        "subject_type": "Agent",
+                        "relation_type": "pratique",
+                        "value_type": "Habit",
+                        "justifications": [
+                            {
+                                "id": "ev-1",
+                                "kind": "memory",
+                                "source": "journal",
+                                "snippet": "Mira a confirmé la pratique hebdomadaire.",
+                                "weight": 0.8,
+                                "timestamp": 1718123123.2,
+                            }
+                        ],
+                        "annotations": {"reason": "upsert_from_intent"},
+                    }
+                ],
+                "events": [],
+                "remove_beliefs": [],
+                "remove_events": [],
+            },
+            "notes": "Mettre à jour le résumé hebdomadaire pour refléter cette progression.",
+        },
+    ),
+    _spec(
         "entity_linker",
         "AGI_Evolutive/beliefs/entity_linker.py",
         "Résout les entités ambiguës et propose un identifiant canonique.",
         AVAILABLE_MODELS["fast"],
-        extra_instructions=("Retourne un champ 'confidence'.",
+        extra_instructions=(
+            "Lis le champ 'action' pour adapter la réponse (resolve, merge...).",
+            "Retourne les informations dans un objet 'entity' (canonical_id, name, entity_type, confidence, justification, aliases).",
+            "Expose 'aliases' supplémentaires et des recommandations dans 'notes' si utile.",
         ),
         example_output={
-            "mention": "le rituel du jeudi",
-            "canonical_entity": "rituel_pause_jeudi_soir",
-            "confidence": 0.77,
-            "resolved_type": "Rituel",
-            "justification": "Correspond au temps calme hebdomadaire consigné dans les mémoires.",
+            "entity": {
+                "canonical_id": "rituel_pause_jeudi_soir",
+                "name": "rituel du jeudi",
+                "entity_type": "Rituel",
+                "confidence": 0.77,
+                "justification": "Correspond au temps calme hebdomadaire consigné dans les mémoires.",
+                "aliases": ["rituel du jeudi"],
+            },
+            "aliases": ["rituel_pause"],
             "notes": "Associer également le tag 'auto-soin'.",
         },
     ),
@@ -1788,14 +2112,39 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
     _spec(
         "code_evolver",
         "AGI_Evolutive/self_improver/code_evolver.py",
-        "Analyse une règle heuristique et suggère un patch ciblé.",
+        "Analyse les cibles fournies et propose des patches complets déjà évalués.",
         AVAILABLE_MODELS["reasoning"],
-        extra_instructions=("Propose un diff minimal et une justification.",),
+        extra_instructions=(
+            "Retourne un champ 'summary' global pour contextualiser le lot.",
+            "Expose 'patches' comme une liste d'objets structurés.",
+            "Chaque patch doit inclure id, target_id, summary, patched_source et idéalement un diff.",
+            "Ajoute 'assessment' (should_promote bool, confidence 0-1, rationale).",
+            "Fournis 'evaluation' avec quality, expected_metrics et canary (mappings).",
+            "Ajoute 'notes' ou 'metadata' si des risques ou suivis sont nécessaires.",
+        ),
         example_output={
-            "issue_summary": "Seuil de détection trop élevé",
-            "suggested_patch": "- threshold = 0.9\n+ threshold = 0.75",
-            "expected_effect": "Détecter plus tôt les dérives",
-            "notes": "",
+            "summary": "Alléger la fonction _score pour améliorer la sensibilité.",
+            "patches": [
+                {
+                    "id": "patch-abduction-score",
+                    "target_id": "reasoning_abduction_score",
+                    "summary": "Rééquilibre les poids de la fonction _score pour éviter la saturation.",
+                    "patched_source": "def _score(...):\n    weight = 0.72\n    ...",
+                    "diff": "- weight = 0.9\n+ weight = 0.72",
+                    "assessment": {
+                        "should_promote": True,
+                        "confidence": 0.74,
+                        "rationale": "Améliore la réactivité sans ajouter de dette supplémentaire.",
+                    },
+                    "evaluation": {
+                        "quality": {"passed": True, "risks": []},
+                        "expected_metrics": {"accuracy": 0.66, "latency_delta": -0.05},
+                        "canary": {"passed": True, "notes": "Aucune régression détectée."},
+                    },
+                    "notes": "Prévoir un suivi sur les scénarios à très faible signal.",
+                }
+            ],
+            "notes": "Aucun autre patch pertinent pour ce lot.",
         },
     ),
     _spec(
@@ -1882,6 +2231,21 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
         },
     ),
     _spec(
+        "phenomenal_mode_manager",
+        "AGI_Evolutive/runtime/phenomenal_kernel.py",
+        "Ajuste le mode courant (travail/flânerie) et le budget associé.",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Retourne 'mode', 'flanerie_ratio', 'flanerie_budget_remaining' et éventuellement 'justification'.",
+        ),
+        example_output={
+            "mode": "travail",
+            "flanerie_ratio": 0.18,
+            "flanerie_budget_remaining": 420.0,
+            "justification": "niveau d'énergie suffisant et alertes modérées",
+        },
+    ),
+    _spec(
         "system_monitor",
         "AGI_Evolutive/runtime/system_monitor.py",
         "Commente un snapshot système et identifie les risques.",
@@ -1898,18 +2262,36 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
     _spec(
         "response_formatter",
         "AGI_Evolutive/runtime/response.py",
-        "Reformule une chaîne de raisonnement en réponse structurée.",
+        "Reformule une chaîne de raisonnement ou un contrat de réponse.",
         AVAILABLE_MODELS["fast"],
-        extra_instructions=("Fournis les sections hypothese/incertitude/besoins/questions.",),
+        extra_instructions=(
+            "Retourne 'message' et un bloc optionnel 'diagnostics' (hypothese/incertitude/besoins/questions).",
+        ),
         example_output={
-            "hypothese": "Je cherche une validation affective après le dialogue tendu",
-            "incertitude": "difficile d'estimer la disponibilité émotionnelle de l'interlocuteur",
-            "besoins": ["temps calme partagé", "réassurance sur l'engagement mutuel"],
-            "questions": [
-                "Serais-tu disponible pour revisiter ce que tu as ressenti ?",
-                "Quel geste te ferait sentir soutenu maintenant ?",
-            ],
-            "notes": "Prévoir un suivi si la vulnérabilité perçue reste élevée.",
+            "message": "Hypothèse principale : la configuration doit être revue (confiance ~0.72).",
+            "diagnostics": {
+                "hypothese": "La configuration actuelle n'est plus alignée",
+                "incertitude": 0.28,
+                "besoins": ["confirmer la date du dernier déploiement"],
+                "questions": ["Souhaites-tu une vérification automatique ?"],
+            },
+        },
+    ),
+    _spec(
+        "response_contract",
+        "AGI_Evolutive/runtime/response.py",
+        "Normalise le contrat conversationnel (hypothèse, incertitude, besoins).",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Retourne au minimum 'hypothese', 'incertitude', 'prochain_test', 'appris', 'besoins'.",
+            "Assure-toi que 'incertitude' est un float entre 0 et 1.",
+        ),
+        example_output={
+            "hypothese": "clarifier l'attente utilisateur",
+            "incertitude": 0.42,
+            "prochain_test": "proposer deux plans d'action",
+            "appris": ["l'utilisateur préfère un accompagnement pas à pas"],
+            "besoins": ["valider la priorité immédiate"],
         },
     ),
     _spec(
@@ -3135,6 +3517,187 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
             "keywords": ["onboarding", "validation", "support", "documentation"],
             "confidence": 0.7,
             "notes": "Complète les exigences générées automatiquement par _extract_requirements.",
+        },
+    ),
+    _spec(
+        "experiential_learning_cycle",
+        "AGI_Evolutive/learning/__init__.py",
+        "Synthétise un épisode d'apprentissage expérientiel et fournit toutes les mises à jour nécessaires.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Résume l'expérience dans 'summary' en français clair.",
+            "Retourne 'confidence' entre 0 et 1.",
+            "Liste 'actions' (label, goal, priority, rationale) prêtes à exécuter.",
+            "Expose 'memory_updates' avec les écritures à réaliser (kind, payload).",
+            "Complète 'metrics' avec des compteurs clés (episodes_completed, insights, etc.).",
+            "Ajoute 'notes' pour les signaux additionnels ou les incertitudes.",
+        ),
+        example_output={
+            "summary": "L'agent a identifié une panne récurrente côté API et prépare un plan correctif.",
+            "confidence": 0.74,
+            "actions": [
+                {
+                    "label": "Informer l'équipe backend",
+                    "goal": "clôturer l'incident",
+                    "priority": 1,
+                    "rationale": "L'analyse LLM détecte un impact client élevé.",
+                }
+            ],
+            "memory_updates": [
+                {
+                    "kind": "learning_episode",
+                    "payload": {"tags": ["incident", "api"], "integration_level": 0.68},
+                }
+            ],
+            "metrics": {"episodes_completed": 18, "insights": 7},
+            "notes": ["Prévoir une vérification des droits d'accès."],
+        },
+    ),
+    _spec(
+        "learning_self_assessment",
+        "AGI_Evolutive/learning/__init__.py",
+        "Évalue la maîtrise d'un concept et retourne la couverture détaillée.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Renseigne 'confidence' entre 0 et 1.",
+            "Expose 'coverage' avec les clés 'definition', 'examples', 'counterexample'.",
+            "Liste jusqu'à 5 'evidence' textuelles pertinentes.",
+            "Ajoute 'notes' pour les recommandations ou limites.",
+        ),
+        example_output={
+            "concept": "principe_X",
+            "confidence": 0.64,
+            "coverage": {
+                "definition": 1.0,
+                "examples": 0.5,
+                "counterexample": 0.25,
+            },
+            "evidence": [
+                "def:Le concept est défini dans la note 2024-06-01",
+                "ex:Usage validé lors du ticket #4812",
+            ],
+            "notes": ["Renforcer les contre-exemples pratiques."],
+        },
+    ),
+    _spec(
+        "learning_auto_curriculum",
+        "AGI_Evolutive/learning/__init__.py",
+        "Analyse la promotion d'une intention et met à jour le curriculum d'apprentissage.",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Retourne 'curriculum_entry' avec la cible, les checkpoints et les signaux.",
+            "Ajoute 'adjustments' pour les compétences à mettre à jour.",
+            "Expose 'notes' pour tracer les décisions.",
+        ),
+        example_output={
+            "curriculum_entry": {
+                "action_type": "code_refactor",
+                "checkpoints": ["valider les tests", "documenter la décision"],
+                "signals": ["auto_evolution:success"],
+            },
+            "adjustments": {"momentum": 0.62, "experimentation": 0.7},
+            "notes": ["Renforcer la coordination avec le module reasoning."],
+        },
+    ),
+    _spec(
+        "learning_meta_controller",
+        "AGI_Evolutive/learning/__init__.py",
+        "Produit les ajustements globaux suite au feedback d'un module d'apprentissage.",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Fournis 'adjustments' (clé → nouvelle valeur ou delta).",
+            "Ajoute 'alerts' si un module dérive fortement.",
+            "Documente 'notes' pour expliquer la décision.",
+        ),
+        example_output={
+            "module": "experiential",
+            "adjustments": {
+                "learning_rate": {"target": 0.12, "rationale": "score en baisse"},
+                "momentum": {"delta": -0.05},
+            },
+            "alerts": ["Surveillance requise sur les contre-exemples."],
+            "notes": ["Le taux de réussite des dernières itérations est < 0.4."],
+        },
+    ),
+    _spec(
+        "learning_curriculum_planner",
+        "AGI_Evolutive/learning/__init__.py",
+        "Synthétise un plan de curriculum à partir de l'historique de feedback.",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Retourne 'focus_modules' triés par priorité.",
+            "Décris chaque entrée dans 'recommendations' avec objectifs et métriques.",
+            "Ajoute 'review_after' (en minutes) pour replanifier.",
+        ),
+        example_output={
+            "focus_modules": ["experiential", "transfer"],
+            "recommendations": [
+                {
+                    "module": "experiential",
+                    "objective": "Réduire l'erreur moyenne",
+                    "target_score": 0.7,
+                    "metrics": ["prediction_error"],
+                }
+            ],
+            "review_after": 45,
+            "notes": ["Plan issu des trois derniers feedbacks."],
+        },
+    ),
+    _spec(
+        "learning_transfer_mapping",
+        "AGI_Evolutive/learning/__init__.py",
+        "Planifie un transfert de connaissances entre domaines et retourne l'état mis à jour.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Résume le transfert dans 'summary'.",
+            "Expose 'updated_target' avec les nouvelles connaissances à persister.",
+            "Liste 'transferred_items' et 'difficulties'.",
+            "Renseigne 'success_score' entre 0 et 1.",
+        ),
+        example_output={
+            "summary": "Les procédures de diagnostic réseau sont adaptées au domaine cloud.",
+            "transferred_items": ["procedure:diagnostic_ping", "principle:root_cause"],
+            "difficulties": ["concept:latency_budget"],
+            "success_score": 0.68,
+            "updated_target": {
+                "procedures": ["diagnostic_ping (adapté)"],
+                "principles": ["root_cause (généralisé)"],
+            },
+            "notes": ["Prévoir un suivi utilisateur après déploiement."],
+        },
+    ),
+    _spec(
+        "learning_reinforcement_policy",
+        "AGI_Evolutive/learning/__init__.py",
+        "Décide de l'action à entreprendre et met à jour la valeur estimée selon le retour.",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Retourne 'action' (string) et 'estimated_value'.",
+            "Expose 'policy_notes' si des précautions sont nécessaires.",
+            "Ajoute 'confidence' entre 0 et 1.",
+        ),
+        example_output={
+            "action": "prioriser_documentation",
+            "estimated_value": 0.58,
+            "confidence": 0.61,
+            "policy_notes": ["Alternative: lancer un test utilisateur ciblé."],
+        },
+    ),
+    _spec(
+        "learning_curiosity_update",
+        "AGI_Evolutive/learning/__init__.py",
+        "Calcule la récompense intrinsèque associée à un stimulus et ajuste le niveau de curiosité.",
+        AVAILABLE_MODELS["fast"],
+        extra_instructions=(
+            "Retourne 'reward' dans [-1, 1].",
+            "Mets à jour 'curiosity_level' entre 0 et 1.",
+            "Ajoute 'signals' éventuels pour la motivation des goals.",
+        ),
+        example_output={
+            "reward": 0.32,
+            "curiosity_level": 0.57,
+            "signals": ["motivation_boost"],
+            "notes": ["Stimulus nouveau: 78% des tokens inédits."],
         },
     ),
 )

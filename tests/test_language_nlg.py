@@ -1,6 +1,7 @@
-import random
 import sys
 from pathlib import Path
+from typing import Any, Mapping
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -9,87 +10,79 @@ if str(ROOT) not in sys.path:
 from AGI_Evolutive.language import nlg
 
 
-def _make_tracker() -> nlg.QualityTracker:
-    ema_explorer = nlg.BanditExplorer(epsilon=0.0, seed=777)
-    ema = nlg.AdaptiveEMA(betas=(0.5,), explorer=ema_explorer)
-    return nlg.QualityTracker(evaluator=nlg.DefaultQualityEvaluator(), ema=ema)
+class _StubLLMManager:
+    def __init__(self, responses: list[Mapping[str, Any]]):
+        self._responses = list(responses)
+        self.calls: list[tuple[str, Mapping[str, Any]]] = []
+
+    def call_dict(self, spec_key: str, *, input_payload: Mapping[str, Any], **_: Any):
+        self.calls.append((spec_key, dict(input_payload)))
+        if not self._responses:
+            raise AssertionError(f"Unexpected call for spec {spec_key}: {input_payload}")
+        return self._responses.pop(0)
 
 
-def test_paraphrase_light_bandit_guides_choices():
-    explorer = nlg.BanditExplorer(epsilon=0.0, seed=123)
-    tracker = _make_tracker()
-    classifier = nlg.OnlineFallbackClassifier()
+def test_apply_mai_bids_updates_context(monkeypatch):
+    manager = _StubLLMManager(
+        [
+            {
+                "message": "Réponse finale polie.",
+                "sections": [
+                    {"name": "introduction", "text": "Merci pour la clarté de ta question."},
+                    {"name": "body", "text": "Voici ma recommandation complète."},
+                ],
+                "applied_actions": [{"origin": "llm", "hint": "structured_sections"}],
+                "meta": {"confidence": 0.87},
+            }
+        ]
+    )
+    monkeypatch.setattr(nlg, "get_llm_manager", lambda: manager)
 
-    text = "C'est important pour le plan."
-    result = nlg.paraphrase_light(
-        text,
-        prob=1.0,
-        explorer=explorer,
-        quality_tracker=tracker,
-        classifier=classifier,
-        rng=random.Random(0),
+    context = nlg.NLGContext("Base brute", apply_hint=lambda text, hint: f"{hint}:{text}")
+    result = nlg.apply_mai_bids_to_nlg(
+        context,
+        state={"dialogue": {"turn": 3}, "memory": {"last_summary": "memo"}},
+        predicate_registry=None,
+        contract={"goal": "support"},
+        reasoning={"summary": "analyse"},
+        metadata={"style": {"tone": "calme"}, "diagnostic": "ok"},
+        llm_manager=manager,
     )
 
-    assert "important" not in result
-    assert any(syn in result for syn in ("clé", "central", "majeur"))
-    params = explorer.arm_parameters("important")
-    assert params
-    # The chosen synonym should have received additional reward mass
-    chosen_alpha = max(alpha for alpha, _ in params.values())
-    assert chosen_alpha > 1.0
+    assert context.text == "Réponse finale polie."
+    assert result.sections[0]["text"].startswith("Merci")
+    assert context.meta["confidence"] == 0.87
+    assert context.applied_hints()[0]["hint"] == "structured_sections"
+
+    spec_key, payload = manager.calls[0]
+    assert spec_key == "language_nlg"
+    assert payload["mode"] == "reply"
+    assert payload["contract"]["goal"] == "support"
+    assert payload["metadata"]["diagnostic"] == "ok"
 
 
-def test_paraphrase_light_handles_accents_and_elisions():
-    explorer = nlg.BanditExplorer(epsilon=0.0, seed=321)
-    tracker = _make_tracker()
-    classifier = nlg.OnlineFallbackClassifier()
-    rng = random.Random(1)
+def test_generation_falls_back_to_base_text_when_empty_response():
+    manager = _StubLLMManager([{}])
+    service = nlg.LanguageGeneration(llm_manager=manager)
 
-    text = "L'idée est simple et par défaut nous gagnons."
-    result = nlg.paraphrase_light(
-        text,
-        prob=1.0,
-        explorer=explorer,
-        quality_tracker=tracker,
-        classifier=classifier,
-        rng=rng,
-    )
+    request = nlg.NLGRequest(base_text="Base text only")
+    result = service.generate(request)
 
-    # Ensure normalized entries were matched despite accents
-    assert "L’" in result or "L'" in result
-    assert "intuition" in result or "piste" in result
-    assert "basique" in result or "élémentaire" in result
+    assert result.message == "Base text only"
+    assert result.sections == []
+    assert service.last_result is result
 
 
-def test_paraphrase_light_fallback_classifier_after_training():
-    explorer = nlg.BanditExplorer(epsilon=0.0, seed=555)
-    tracker = _make_tracker()
-    classifier = nlg.OnlineFallbackClassifier()
-    for _ in range(8):
-        classifier.update("cool", 1.0)
+def test_paraphrase_light_uses_paraphrase_mode(monkeypatch):
+    manager = _StubLLMManager([
+        {"message": "Version paraphrasée."}
+    ])
+    monkeypatch.setattr(nlg, "get_llm_manager", lambda: manager)
 
-    text = "C'est vraiment cool!"
-    result = nlg.paraphrase_light(
-        text,
-        prob=0.0,
-        explorer=explorer,
-        quality_tracker=tracker,
-        classifier=classifier,
-        rng=random.Random(2),
-    )
+    output = nlg.paraphrase_light("Original", tone="doux", llm_manager=manager)
 
-    assert "cool" not in result
-    assert any(syn in result for syn in ("sympa", "amusant"))
-
-
-def test_quality_tracker_records_history():
-    tracker = _make_tracker()
-    scores = [tracker.observe("test", candidate) for candidate in ("test", "Test", "TEST!")]
-    assert all(0.0 <= score <= 1.0 for score in scores)
-    assert len(tracker.quality_history()) == len(scores)
-
-
-def test_join_tokens_elides_vowels():
-    result = nlg.join_tokens(["le", "amour", "arrive"])
-    assert "l’" in result or "l'" in result
-
+    assert output == "Version paraphrasée."
+    spec_key, payload = manager.calls[0]
+    assert spec_key == "language_nlg"
+    assert payload["mode"] == "paraphrase"
+    assert payload["metadata"]["tone"] == "doux"

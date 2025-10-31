@@ -46,11 +46,12 @@ def test_build_prompt_includes_directive_example_and_extra():
 
 
 @pytest.mark.parametrize("key", [
-    "intent_classification",
+    "intent_ingestion",
     "language_understanding",
     "concept_extraction",
     "planner_support",
-    "rag5_controller",
+    "retrieval_orchestrator",
+    "retrieval_answer",
     "reward_engine",
     "identity_mission",
 ])

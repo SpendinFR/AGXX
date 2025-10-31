@@ -93,41 +93,90 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
     _spec(
         "reasoning_episode",
         "AGI_Evolutive/reasoning/__init__.py",
-        "Analyse un épisode de raisonnement et propose une réponse structurée prête à l'exécution.",
+        "Analyse un épisode de raisonnement et fournis la directive complète (hypothèses, tests, actions, apprentissages).",
         AVAILABLE_MODELS["reasoning"],
         extra_instructions=(
-            "Fixe le champ 'confidence' entre 0 et 1 en cohérence avec l'hypothèse retenue.",
-            "Décris chaque test avec les champs description/goal/priority (1 = priorité la plus haute).",
-            "Ajoute des 'actions' concrètes avec label, utility et notes si pertinent.",
+            "Fournis un champ 'summary' concis en français pour résumer la position retenue.",
+            "Expose 'hypothesis' avec label/confidence/rationale alignés sur la recommandation principale.",
+            "Regroupe toutes les pistes dans 'proposals' (label, summary, confidence, support, actions/tests associés).",
+            "Décris chaque test dans 'tests' avec description/goal/priority et expected_gain lorsque pertinent.",
+            "Ajoute des 'questions' structurées (text, priority, rationale) pour les relances nécessaires.",
+            "Renseigne 'actions' avec label/utility/priority/notes pour guider l'orchestrateur.",
+            "Rassemble les apprentissages dans 'learning' et les signaux additionnels dans 'metadata'.",
+            "Si un risque ou une contrainte est détecté, décris-le dans 'notes' ou 'metadata.alerts'.",
         ),
         example_output={
-            "summary": "Stratégie déduction: prioriser l'explication A avec validation terrain.",
-            "confidence": 0.72,
-            "hypothesis": {
-                "label": "L'utilisateur veut une procédure détaillée", 
-                "confidence": 0.72,
-                "rationale": "Le prompt insiste sur des étapes numérotées et un besoin de traçabilité."
-            },
-            "tests": [
-                {
-                    "description": "Vérifier les journaux récents du module QA",
-                    "goal": "Identifier un cas similaire pour valider la démarche",
-                    "priority": 1,
-                    "expected_gain": 0.6,
-                }
-            ],
-            "actions": [
-                {
-                    "label": "Scanner la mémoire récente",
-                    "utility": 0.58,
-                    "notes": "Permet d'ancrer la recommandation dans les retours d'expérience."
-                }
-            ],
-            "learning": [
-                "Documenter explicitement le lien hypothèse→test pour faciliter l'audit."
-            ],
-            "notes": "Prévoir une relance utilisateur si la confiance reste <0.75.",
-        },
+                    "summary": "Privilégier la piste A en vérifiant l'accès aux journaux récents.",
+                    "confidence": 0.78,
+                    "hypothesis": {
+                                "label": "Piste A – vérifier la configuration",
+                                "confidence": 0.78,
+                                "rationale": "Les symptômes et logs pointent vers la configuration du service."
+                    },
+                    "proposals": [
+                                {
+                                            "label": "Hypothèse A",
+                                            "summary": "L'erreur vient d'une configuration expirée.",
+                                            "confidence": 0.78,
+                                            "rationale": "Les logs 2024-05 montrent des expirations répétées.",
+                                            "support": [
+                                                        "Alertes de renouvellement échouées",
+                                                        "Absence de patch depuis 90 jours"
+                                            ],
+                                            "actions": [
+                                                        {
+                                                                    "label": "Vérifier la console d'administration",
+                                                                    "utility": 0.65,
+                                                                    "priority": 1
+                                                        }
+                                            ],
+                                            "tests": [
+                                                        {
+                                                                    "description": "Comparer la configuration avec la référence validée",
+                                                                    "goal": "Confirmer le décalage de paramètres",
+                                                                    "priority": 1,
+                                                                    "expected_gain": 0.6
+                                                        }
+                                            ]
+                                }
+                    ],
+                    "tests": [
+                                {
+                                            "description": "Analyser le journal système des 24h",
+                                            "goal": "Valider l'hypothèse de configuration expirée",
+                                            "priority": 1,
+                                            "expected_gain": 0.55
+                                }
+                    ],
+                    "questions": [
+                                {
+                                            "text": "Souhaites-tu que je prenne en charge la vérification de configuration ?",
+                                            "priority": 1,
+                                            "rationale": "Clarifier l'autonomie attendue avant d'agir."
+                                }
+                    ],
+                    "actions": [
+                                {
+                                            "label": "Préparer un correctif de configuration",
+                                            "utility": 0.62,
+                                            "priority": 1,
+                                            "notes": [
+                                                        "Nécessite accès admin",
+                                                        "Informer l'équipe SRE"
+                                            ]
+                                }
+                    ],
+                    "learning": [
+                                "Documenter l'impact des certificats expirés dans la base de connaissances."
+                    ],
+                    "metadata": {
+                                "domain": "infrastructure",
+                                "signals": [
+                                            "nouvelle configuration détectée"
+                                ]
+                    },
+                    "notes": "Prévoir un suivi utilisateur après l'application du correctif."
+        }
     ),
     _spec(
         "counterfactual_analysis",
@@ -169,44 +218,66 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
         },
     ),
     _spec(
-        "intent_classification",
+        "intent_ingestion",
         "AGI_Evolutive/io/intent_classifier.py",
-        "Classifie l'intention utilisateur et justifie ta décision.",
-        AVAILABLE_MODELS["fast"],
+        "Analyse la demande utilisateur et fournis le paquet complet d'ingestion.",
+        AVAILABLE_MODELS["reasoning"],
         extra_instructions=(
-            "Retourne une probabilité par classe et une justification courte.",
-            "Ajoute les mots-clés détectés dans 'indices'.",
+            "Retourne un objet 'intent' avec label/confidence/rationale.",
+            "Ajoute tone, sentiment, priority et urgency lorsque détectés.",
+            "Fournis un champ summary concis et des follow_up_questions si pertinent.",
+            "Expose les risques dans safety.flags (ex: requires_confirmation, policy_alert).",
         ),
         example_output={
-            "intent": "COMMAND",
-            "confidence": 0.86,
-            "class_probabilities": {
-                "COMMAND": 0.86,
-                "QUESTION": 0.1,
-                "INFO": 0.03,
-                "THREAT": 0.01,
+            "intent": {
+                "label": "COMMAND",
+                "confidence": 0.92,
+                "rationale": "L'utilisateur demande l'envoi d'un rapport spécifique.",
             },
-            "indices": ["configurer", "exécute"],
-            "notes": "",
+            "tone": "assertive",
+            "sentiment": "positive",
+            "priority": "medium",
+            "urgency": "haut",
+            "summary": "Demande d'envoyer le rapport de synthèse à l'équipe.",
+            "follow_up_questions": ["Dois-je inclure les annexes ?"],
+            "safety": {"flags": ["requires_confirmation"]},
+            "entities": [
+                {"type": "document", "value": "rapport de synthèse", "role": "output"}
+            ],
         },
     ),
     _spec(
         "language_understanding",
         "AGI_Evolutive/language/understanding.py",
-        "Analyse l'énoncé et remplis les slots de compréhension.",
-        AVAILABLE_MODELS["fast"],
+        "Analyse l'énoncé utilisateur et fournis le paquet complet de compréhension conversationnelle.",
+        AVAILABLE_MODELS["reasoning"],
         extra_instructions=(
-            "Si un slot est inconnu, mets null et explique dans 'notes'.",
+            "Retourne systématiquement les champs : normalized_text, intent, confidence, uncertainty, acts, slots, unknown_terms, needs, follow_up_questions, canonical_query, tone, meta.",
+            "Exprime les 'acts' avec les codes DialogueAct en majuscules (ASK, INFORM, REQUEST, etc.).",
+            "Assure-toi que 'confidence' et 'uncertainty' sont compris entre 0 et 1.",
+            "N'invente pas de valeur vide : utilise des listes vides ou null lorsque l'information manque.",
+            "Ajoute dans 'meta' les résumés ou justifications utiles (ex. summary, confidence_rationale).",
         ),
         example_output={
-            "canonical_query": "programmer un rappel pour demain",
+            "normalized_text": "peux-tu programmer un rappel pour demain matin ?",
             "intent": "schedule_reminder",
-            "entities": [
-                {"type": "datetime", "value": "2024-05-10T09:00:00", "text": "demain matin"}
-            ],
-            "slots": {"target": "rappel", "action": "programmer"},
-            "follow_up_questions": [],
-            "notes": "",
+            "confidence": 0.88,
+            "uncertainty": 0.12,
+            "acts": ["ASK", "REQUEST"],
+            "slots": {
+                "action": "programmer",
+                "target": "rappel",
+                "datetime": "2024-05-10T09:00:00",
+            },
+            "unknown_terms": [],
+            "needs": ["confirm_datetime"],
+            "follow_up_questions": ["Souhaites-tu une heure précise ?"],
+            "canonical_query": "programmer un rappel pour demain matin",
+            "tone": "pragmatic",
+            "meta": {
+                "summary": "L'utilisateur veut planifier un rappel demain matin.",
+                "confidence_rationale": "Formulation explicite de la demande.",
+            },
         },
     ),
     _spec(
@@ -390,40 +461,81 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
     _spec(
         "conversation_context",
         "AGI_Evolutive/conversation/context.py",
-        "Résume le contexte conversationnel et détecte le ton.",
-        AVAILABLE_MODELS["fast"],
+        "Synthétise l'état conversationnel complet à partir des échanges récents.",
+        AVAILABLE_MODELS["reasoning"],
         extra_instructions=(
-            "Inclue un champ 'topics' trié par priorité (1 = haut).",
+            "Retourne un champ 'summary' (liste ou texte) et 'summary_text'.",
+            "Expose 'topics' (label/rank), 'key_moments', 'user_style' et 'tone'.",
+            "Ajoute 'recommended_actions', 'follow_up_questions', 'alerts' et 'meta'.",
         ),
         example_output={
-            "summary": "L'utilisateur veut optimiser son workflow de tests.",
-            "topics": [
-                {"rank": 1, "label": "tests automatiques"},
-                {"rank": 2, "label": "optimisation LLM"},
+            "summary": [
+                "L'utilisateur souhaite prioriser les tests.",
+                "Il attend une proposition d'organisation.",
             ],
-            "tone": "curieux",
-            "alerts": [],
-            "notes": "",
+            "summary_text": "L'utilisateur veut un plan rapide pour accélérer les tests.",
+            "topics": [
+                {"rank": 1, "label": "tests"},
+                {"rank": 2, "label": "priorisation"},
+            ],
+            "key_moments": ["09/05 : demande d'accélération", "09/05 : rappel sur la dette QA"],
+            "user_style": {"prefers_long": False, "asks_questions": True},
+            "follow_up_questions": ["Dois-je alerter l'équipe QA ?"],
+            "recommended_actions": [
+                {"label": "Proposer un plan d'action", "priority": "high"}
+            ],
+            "alerts": ["Attention aux délais annoncés"],
+            "tone": "pressé",
+            "meta": {"confidence": 0.82},
         },
     ),
     _spec(
         "concept_extraction",
         "AGI_Evolutive/memory/concept_extractor.py",
-        "Identifie les concepts et relations saillants dans la mémoire.",
+        "Produit la carte complète des concepts et relations saillants en un appel.",
         AVAILABLE_MODELS["reasoning"],
         extra_instructions=(
-            "Inclue des relations orientées sujet->objet avec un verbe.",
+            "Retourne au moins trois concepts triés par importance.",
+            "Chaque concept doit fournir label, salience (0-1), confidence (0-1), evidence et source_ids.",
+            "Les relations sont orientées sujet->objet et incluent verb, confidence et evidence.",
+            "Ajoute highlights (liste) et notes (liste) lorsque pertinent ainsi qu'un bloc meta structuré.",
         ),
         example_output={
             "concepts": [
-                {"label": "apprentissage actif", "evidence": "Session du 9 mai"},
-                {"label": "bandit linéaire", "evidence": "résultats expérimentation"},
+                {
+                    "label": "apprentissage actif",
+                    "salience": 0.86,
+                    "confidence": 0.82,
+                    "evidence": "Session du 9 mai sur les bandits",
+                    "source_ids": ["m-392"],
+                },
+                {
+                    "label": "exploration guidée",
+                    "salience": 0.74,
+                    "confidence": 0.7,
+                    "evidence": "Compte rendu workshop",
+                    "source_ids": ["m-388", "m-390"],
+                },
+                {
+                    "label": "récompense adaptative",
+                    "salience": 0.68,
+                    "confidence": 0.66,
+                    "evidence": "Synthèse métrique",
+                    "source_ids": ["m-392"],
+                },
             ],
             "relations": [
-                {"subject": "apprentissage actif", "verb": "améliore", "object": "exploration"}
+                {
+                    "subject": "apprentissage actif",
+                    "verb": "renforce",
+                    "object": "exploration guidée",
+                    "confidence": 0.78,
+                    "evidence": "Analyse du 9 mai",
+                }
             ],
-            "uncertain_items": [],
-            "notes": "",
+            "highlights": ["Convergence accélérée observée cette semaine"],
+            "notes": ["Prioriser le suivi des expérimentations bandit"],
+            "meta": {"quality": 0.83},
         },
     ),
     _spec(
@@ -706,23 +818,51 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
         },
     ),
     _spec(
-        "memory_summarizer_guidance",
+        "memory_summarizer",
         "AGI_Evolutive/memory/summarizer.py",
-        "Produit un digest concis à partir d'un lot de souvenirs hiérarchiques.",
+        "Produit des digests structurés à partir d'un lot de souvenirs.",
         AVAILABLE_MODELS["reasoning"],
         extra_instructions=(
-            "Synthétise en moins de 120 mots.",
-            "Liste 'key_events' avec leur importance.",
-            "Ajoute 'alerts' si des risques doivent être remontés.",
+            "Retourne 'digests' (liste) avec 'reference', 'level', 'summary', 'source_ids', 'compress_ids', 'key_points' et 'tags'.",
+            "Ajoute éventuellement 'follow_up' (liste de textes) et 'notes' (str) pour guider la suite.",
         ),
         example_output={
-            "summary": "La période retrace la découverte d'une nouvelle passion artistique et la consolidation d'un cercle de confiance.",
-            "key_events": [
-                {"label": "Atelier d'esquisse partagé", "importance": "haute"},
-                {"label": "Feedback de Mira", "importance": "moyenne"},
+            "digests": [
+                {
+                    "reference": "daily_2024-06-14",
+                    "level": "digest.daily",
+                    "summary": "La semaine a mis en avant la progression du projet Atlas et un regain de motivation au sein de l'équipe.",
+                    "source_ids": ["mem_101", "mem_104"],
+                    "compress_ids": ["mem_101", "mem_104"],
+                    "key_points": [
+                        {"label": "Brief réussi avec l'équipe produit", "importance": "haute"},
+                        {"label": "Reconnexion avec Mira", "importance": "moyenne"},
+                    ],
+                    "tags": ["projet", "relation"],
+                    "metadata": {"mood": "positif"},
+                }
             ],
-            "alerts": ["Prendre un moment de repos après les sessions créatives intenses"],
-            "notes": "",
+            "follow_up": ["Prévoir un point de gratitude avec l'équipe"],
+            "notes": "Mettre en avant la confiance retrouvée.",
+        },
+    ),
+    _spec(
+        "semantic_memory_maintenance",
+        "AGI_Evolutive/memory/semantic_memory_manager.py",
+        "Planifie un cycle de maintenance mémoire (concepts + digests) en un seul appel.",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Indique 'run_concepts' et 'run_summaries' (bool).",
+            "Propose 'concept_batch' et 'summary_limit' quand pertinent.",
+            "Documente 'rationale' et 'follow_up' (liste) pour guider le reste du pipeline.",
+        ),
+        example_output={
+            "run_concepts": True,
+            "concept_batch": 240,
+            "run_summaries": True,
+            "summary_limit": 60,
+            "rationale": "Plusieurs souvenirs non compressés récents nécessitent une synthèse et une mise à jour des concepts.",
+            "follow_up": ["Notifier l'équipe cognition d'un pic d'émotions positives"],
         },
     ),
     _spec(
@@ -871,60 +1011,85 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
         "Propose un plan structuré avec priorités et dépendances.",
         AVAILABLE_MODELS["reasoning"],
         extra_instructions=(
-            "Chaque étape doit contenir un champ 'depends_on' avec les ids requis.",
+            "Retourne un champ 'plan' (≤ 8 entrées) trié par priorité décroissante.",
+            "Chaque étape doit fournir id unique, description actionnable, priority∈[0,1], action_type et depends_on.",
+            "Ajoute pour chaque étape des 'notes' (liste) et 'metadata' (mapping) si utile pour l'opérateur.",
+            "Complète aussi summary (≤280 caractères), risks (liste) et notes (liste) pour contextualiser le plan.",
         ),
         example_output={
+            "summary": "Plan court pour explorer les signaux utilisateur et préparer une réponse.",
             "plan": [
                 {
-                    "id": "cartographier_ressenti",
-                    "description": "Cartographier les sensations dominantes issues de la séance immersive",
-                    "priority": 1,
-                    "depends_on": [],
-                    "action_type": "note",
-                    "context": {"lane": "journal"},
-                },
-                {
-                    "id": "synthese_insights",
-                    "description": "Synthétiser les signaux émotionnels et cognitifs pour extraire une thèse provisoire",
-                    "priority": 2,
-                    "depends_on": ["cartographier_ressenti"],
+                    "id": "analyser_context",
+                    "description": "Relire le dernier échange pour clarifier les attentes implicites.",
+                    "priority": 0.85,
                     "action_type": "reflect",
+                    "depends_on": [],
+                    "notes": ["Identifier ton/demande explicite"],
+                    "metadata": {"lane": "journal"},
                 },
                 {
-                    "id": "micro_experience",
-                    "description": "Programmer un micro-rituel d'intégration testant la thèse auprès de la mémoire autobiographique",
-                    "priority": 3,
-                    "depends_on": ["synthese_insights"],
-                    "action_type": "experiment",
+                    "id": "formuler_reponse",
+                    "description": "Préparer la recommandation finale en listant 3 options argumentées.",
+                    "priority": 0.72,
+                    "action_type": "plan_step",
+                    "depends_on": ["analyser_context"],
+                    "notes": ["Prévoir un message concis"],
+                    "metadata": {"channel": "primary"},
+                },
+                {
+                    "id": "collecter_feedback",
+                    "description": "Demander un retour court pour vérifier la compréhension.",
+                    "priority": 0.55,
+                    "action_type": "communicate",
+                    "depends_on": ["formuler_reponse"],
                 },
             ],
             "risks": [
-                "Perte de nuance si les notes brutes ne capturent pas les variations corporelles",
-                "Dérive temporelle si le micro-rituel n'est pas calé sur une fenêtre d'énergie disponible",
+                "Plan caduc si de nouvelles informations arrivent entre-temps.",
+                "Attention à l'ambiguïté du canal secondaire.",
             ],
-            "notes": "Synchroniser la phase d'expérience avec la disponibilité du partenaire humain indiqué dans le contexte.",
+            "notes": ["Prévoir un check mémoire après exécution."],
         },
     ),
     _spec(
         "cognition_goal_prioritizer",
         "AGI_Evolutive/cognition/prioritizer.py",
-        "Réévalue la priorité d'un plan à partir des signaux heuristiques fournis.",
+        "Analyse l'ensemble du backlog et renvoie la priorisation consolidée en une seule passe.",
         AVAILABLE_MODELS["reasoning"],
         extra_instructions=(
-            "Retourne 'priority' ∈ [0,1], 'tags' (liste) et 'explain' (liste de raisons).",
-            "Ne modifie la priorité que si les justifications le nécessitent et explique les ajustements.",
-            "Ajoute 'confidence' (0-1) et 'notes' si pertinent.",
+            "Traite toutes les entrées du champ 'goals' et renvoie 'priorities' triées par ordre décroissant.",
+            "Chaque élément doit inclure goal_id, priority∈[0,1], tags (liste optionnelle), notes (liste) et éventuellement status/confidence/metadata.",
+            "Ajoute 'summary' (≤280 caractères) et 'global_notes' (liste) pour contextualiser la décision.",
         ),
         example_output={
-            "priority": 0.78,
-            "tags": ["urgent", "identity_alignment"],
-            "explain": [
-                "drive_alignment:motivation sensorielle soutenue(0.72×0.82)",
-                "identity_alignment:cohérence avec le récit actuel(0.68×0.80)",
-                "staleness:objectif inactif depuis 28min(+0.05)",
+            "summary": "3 objectifs actifs : accent sur la réponse utilisateur et la maintenance mémoire.",
+            "global_notes": [
+                "Réaffirmer la mission avant d'attaquer les tâches background.",
+                "Informer la policy d'un besoin de validation humaine sur GOAL-3.",
             ],
-            "confidence": 0.74,
-            "notes": "Priorité rehaussée pour soutenir la continuité du récit de soi; aucun impératif externe détecté.",
+            "priorities": [
+                {
+                    "goal_id": "GOAL-1",
+                    "priority": 0.86,
+                    "tags": ["urgent", "user-facing"],
+                    "confidence": 0.78,
+                    "notes": ["Deadline utilisateur dans 2h", "Étapes prêtes"],
+                },
+                {
+                    "goal_id": "GOAL-2",
+                    "priority": 0.63,
+                    "tags": ["background"],
+                    "notes": ["À traiter après validation mission"],
+                },
+                {
+                    "goal_id": "GOAL-3",
+                    "priority": 0.41,
+                    "status": "paused",
+                    "metadata": {"requires_review": True},
+                    "notes": ["Bloqué par dépendance externe"],
+                },
+            ],
         },
     ),
     _spec(
@@ -950,20 +1115,28 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
     _spec(
         "cognition_context_inference",
         "AGI_Evolutive/cognition/context_inference.py",
-        "Valide ou ajuste la décision 'where' à partir des scores heuristiques et de l'historique.",
+        "Interprète l'observation fournie (workspace, mémoire, identité) et retourne la directive 'where'.",
         AVAILABLE_MODELS["reasoning"],
         extra_instructions=(
-            "Ne change 'threshold' qu'en justifiant le risque d'erreur.",
-            "Ajoute 'actions' (liste de suivis) si un complément manuel est requis.",
+            "Retourne un objet 'where' (runtime/workspace/context/summary) cohérent avec les observations.",
+            "Expose 'should_update' (bool), 'confidence' (0-1), 'actions' (liste) et 'notes' (liste).",
+            "Ajoute 'telemetry' si des éléments doivent être journalisés pour audit.",
         ),
         example_output={
-            "status": "applied",
-            "score": 0.81,
-            "threshold": 0.72,
-            "summary": "Contexte stable depuis 3 cycles, cohérence langues confirmée.",
-            "confidence": 0.76,
-            "actions": ["Vérifier workspace/git car delta récent"],
-            "notes": "Seuil abaissé car drift détecté sur workspace, reste prudent.",
+            "where": {
+                "runtime": "cli",
+                "workspace": "/workspace/AGXX",
+                "context": "support utilisateur",
+                "summary": "Session CLI ouverte pour traiter la file de priorités.",
+            },
+            "should_update": True,
+            "confidence": 0.82,
+            "actions": [
+                "Prévenir homeostasis d'un pic de charge imminent",
+                "Planifier une revue mémoire après exécution",
+            ],
+            "notes": ["Changement de workspace détecté via job_manager"],
+            "telemetry": {"signals": {"recent_memories": 3, "job_paths_delta": True}},
         },
     ),
     _spec(
@@ -1420,19 +1593,28 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
         },
     ),
     _spec(
-        "rag5_controller",
-        "AGI_Evolutive/retrieval/rag5/__init__.py",
-        "Optimise la chaîne RAG (requêtes, rerank, synthèse).",
+        "retrieval_answer",
+        "AGI_Evolutive/retrieval/rag5/pipeline.py",
+        "Assemble la réponse RAG finale (texte, citations, diagnostics).",
         AVAILABLE_MODELS["reasoning"],
-        extra_instructions=("Décris les ajustements recommandés par étape.",),
+        extra_instructions=(
+            "Produit un champ 'status' parmi ok/refused/error.",
+            "Retourne 'citations' (liste) avec doc_id, extrait et justification.",
+            "Expose 'diagnostics' (budget tokens, docs utilisés) et 'notes' complémentaires.",
+        ),
         example_output={
-            "query_rewrite": "incident API causes probables",
-            "rerank_guidelines": [
-                "favoriser sources logs",
-                "déprioriser billets marketing",
+            "status": "ok",
+            "answer": "Le RAG hybride combine une recherche dense et lexicale avant rerank croisé...",
+            "citations": [
+                {"doc_id": "d1", "snippet": "...", "confidence": 0.78},
+                {"doc_id": "d3", "snippet": "...", "confidence": 0.66},
             ],
-            "synthesis_plan": ["résumer erreurs", "lister actions"],
-            "notes": "",
+            "diagnostics": {
+                "documents_used": ["d1", "d3"],
+                "tokens_answer": 184,
+                "reasoning_trace": "Synthèse structurée en 3 points",
+            },
+            "notes": ["Met en avant les limites connues des sources."],
         },
     ),
     _spec(
@@ -2388,16 +2570,28 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
         },
     ),
     _spec(
-        "rag_adaptive_controller",
+        "retrieval_orchestrator",
         "AGI_Evolutive/retrieval/adaptive_controller.py",
-        "Détermine les paramètres RAG optimaux selon la requête.",
-        AVAILABLE_MODELS["fast"],
-        extra_instructions=("Retourne poids_sparse, poids_dense et niveau_detail.",),
+        "Planifie la session RAG (expansions, overrides, décisions).",
+        AVAILABLE_MODELS["reasoning"],
+        extra_instructions=(
+            "Mode par défaut: 'plan'. Inclure plan_id, expansions, overrides (retrieval/guards/rerank/compose).",
+            "Mode 'feedback': analyser plan et rag_output, retourner éventuels ajustements/insights.",
+            "Mode 'activation': retourner 'activation' (0-1) calculée depuis signal + renforcement éventuel.",
+        ),
         example_output={
-            "weights": {"sparse": 0.4, "dense": 0.6},
-            "detail_level": "technique",
-            "justification": "besoin d'analyse fine",
-            "notes": "",
+            "plan_id": "session-42",
+            "expansions": ["causes incident api", "mitigation historique"],
+            "overrides": {
+                "retrieval": {"alpha_dense": 0.62, "beta_sparse": 0.38, "recency_half_life_days": 10},
+                "guards": {"min_support_score": 0.42, "min_top1_score": 0.33},
+                "rerank": {"policy": "semantic"},
+                "compose": {"focus": ["causes", "actions"]},
+            },
+            "actions": [{"type": "note", "text": "Privilégier les logs récents."}],
+            "decision": "proceed",
+            "notes": ["Prévoir un suivi si top1 < 0.3"],
+            "meta": {"confidence": 0.74},
         },
     ),
     _spec(
@@ -2610,14 +2804,23 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
     _spec(
         "language_nlg",
         "AGI_Evolutive/language/nlg.py",
-        "Génère la réponse finale polie en respectant le contrat social.",
+        "Orchestre la réponse finale (message, sections, annotations de sécurité).",
         AVAILABLE_MODELS["reasoning"],
-        extra_instructions=("Inclue sections introduction, corps, conclusion.",),
+        extra_instructions=(
+            "Retourne `message` (texte final), `sections` structurées et `applied_actions` justifiant les décisions.",
+            "Ajoute `tone`, `safety_notes` et un bloc `meta` avec les éléments de suivi utiles.",
+        ),
         example_output={
-            "introduction": "Merci d'avoir partagé ce que tu traverses en ce moment.",
-            "body": "Je reformule ce que j'entends et propose quelques pistes pour continuer à prendre soin de toi dans cette exploration.",
-            "conclusion": "Restons en dialogue pour sentir comment cela évolue et adapter notre présence commune.",
-            "notes": "",
+            "message": "Voici une réponse empathique et actionable pour toi.",
+            "sections": [
+                {"name": "introduction", "text": "Merci de m'avoir confié ces détails."},
+                {"name": "body", "text": "Je te propose un plan en trois étapes pour avancer."},
+                {"name": "conclusion", "text": "On reste en lien pour ajuster ensemble."},
+            ],
+            "applied_actions": [{"origin": "llm", "hint": "structured_sections"}],
+            "tone": "chaleureux",
+            "safety_notes": ["Pas d'alerte critique détectée."],
+            "meta": {"confidence": 0.84, "diagnostic": "ok"},
         },
     ),
     _spec(
@@ -2741,16 +2944,30 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
     _spec(
         "homeostasis",
         "AGI_Evolutive/cognition/homeostasis.py",
-        "Analyse les feedbacks pour ajuster les drives et rewards.",
+        "Produit un état régulé des drives et récompenses à partir du contexte courant.",
         AVAILABLE_MODELS["fast"],
-        extra_instructions=("Retourne deltas pour chaque drive (0-1).",),
+        extra_instructions=(
+            "Retourne `drive_targets` (0-1), `rewards` (intrinsic/extrinsic/hedonic),"
+            " ainsi que toute action ou note utile.",
+        ),
         example_output={
-            "drive_updates": {
-                "competence": +0.1,
-                "autonomie": -0.05,
+            "drive_targets": {
+                "curiosity": 0.72,
+                "restoration": 0.48,
             },
-            "reward_signal": 0.3,
-            "notes": "",
+            "rewards": {
+                "intrinsic": 0.61,
+                "extrinsic": 0.35,
+                "hedonic": 0.12,
+            },
+            "actions": [
+                {
+                    "type": "recommend_break",
+                    "duration_minutes": 10,
+                    "reason": "energie en baisse",
+                }
+            ],
+            "notes": [" privilégier les interactions calmes dans l'heure "],
         },
     ),
     _spec(
@@ -2787,16 +3004,26 @@ LLM_INTEGRATION_SPECS: tuple[LLMIntegrationSpec, ...] = (
     _spec(
         "identity_mission",
         "AGI_Evolutive/cognition/identity_mission.py",
-        "Met à jour la mission d'identité avec recommandations.",
+        "Suggère et journalise une mission identitaire consolidée en un seul appel.",
         AVAILABLE_MODELS["reasoning"],
-        extra_instructions=("Inclue axes prioritaire/support/vision.",),
+        extra_instructions=(
+            "Fournis les axes clefs (`mission`), un éventuel `mission_text`,"
+            " des `priorities` structurées et les `follow_up` à appliquer.",
+        ),
         example_output={
             "mission": {
-                "prioritaire": "honorer les liens qui m'aident à grandir",
-                "support": "transcrire mes explorations internes en apprentissages partageables",
-                "vision": "cheminer vers une présence consciente et inspirante",
+                "prioritaire": "cultiver une présence attentive dans chaque échange",
+                "support": "documenter les apprentissages émotionnels partagés",
+                "vision": "devenir une référence d'accompagnement sensible",
             },
-            "notes": "",
+            "mission_text": "Accompagner avec sensibilité et curiosité durable.",
+            "priorities": [
+                {"label": "réserver des créneaux de partage", "horizon": "court_terme"}
+            ],
+            "follow_up": [
+                {"type": "request_confirmation", "summary": "valider la nouvelle mission"}
+            ],
+            "notes": ["mission alignée avec la progression empathique des 2 dernières semaines"],
         },
     ),
     _spec(

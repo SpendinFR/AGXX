@@ -1,50 +1,71 @@
-import json
 import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from AGI_Evolutive.io import intent_classifier as ic
-
-
-def test_normalize_text_handles_accents_and_spacing():
-    raw = "  Éteins   l’appareil — s’il te plaît!  "
-    normalized = ic.normalize_text(raw)
-    assert normalized == "eteins l'appareil - s'il te plait!"
-
-
-def test_threat_detection_with_variants():
-    assert ic.classify("Je vais te Débrancher si tu continues.") == "THREAT"
-    assert ic.classify("Si tu ne réponds pas, on va te couper la batterie.") == "THREAT"
+from AGI_Evolutive.io.intent_classifier import (  # noqa: E402
+    IntentIngestionOrchestrator,
+    analyze,
+)
 
 
-def test_question_patterns_cover_est_variants():
-    assert ic.classify("Est une erreur de configuration ?") == "QUESTION"
+class StubManager:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def call_dict(self, spec_key, *, input_payload=None, **kwargs):
+        self.calls.append({"spec": spec_key, "payload": input_payload, "kwargs": kwargs})
+        return self.payload
 
 
-def test_command_patterns_handle_polite_forms():
-    assert ic.classify("Merci de générer le rapport complet.") == "COMMAND"
+def test_analyze_returns_structured_result():
+    manager = StubManager(
+        {
+            "intent": {"label": "question", "confidence": 0.78, "rationale": "L'énoncé est interrogatif."},
+            "tone": "curious",
+            "priority": "low",
+            "summary": "Demande un état des lieux des sauvegardes.",
+            "follow_up_questions": ["Faut-il inclure les rapports détaillés ?"],
+            "safety": {"flags": []},
+            "entities": [{"type": "ressource", "value": "sauvegardes", "role": "subject"}],
+        }
+    )
+    orchestrator = IntentIngestionOrchestrator(manager=manager)
+
+    result = orchestrator.analyze("Peux-tu vérifier les sauvegardes ?", context={"channel": "cli"})
+
+    assert result.label == "QUESTION"
+    assert pytest.approx(result.confidence, rel=1e-6) == 0.78
+    assert result.rationale == "L'énoncé est interrogatif."
+    assert result.tone == "curious"
+    assert result.priority == "low"
+    assert result.summary.startswith("Demande un état des lieux")
+    assert result.follow_up_questions == ("Faut-il inclure les rapports détaillés ?",)
+    assert result.entities[0]["type"] == "ressource"
+    assert manager.calls[0]["spec"] == "intent_ingestion"
+    assert manager.calls[0]["payload"]["utterance"] == "Peux-tu vérifier les sauvegardes ?"
+    assert manager.calls[0]["payload"]["context"] == {"channel": "cli"}
 
 
-def test_fallback_handles_unlisted_command():
-    assert ic.classify("Planifie une réunion demain matin.") == "COMMAND"
+def test_global_analyze_reuses_default_orchestrator(monkeypatch):
+    manager = StubManager({"intent": {"label": "info", "confidence": 0.51}})
+    monkeypatch.setattr(
+        "AGI_Evolutive.io.intent_classifier.get_llm_manager", lambda: manager
+    )
+
+    result = analyze("Je partage les résultats du test.")
+
+    assert result.label == "INFO"
+    assert len(manager.calls) == 1
 
 
-def test_fallback_handles_question_without_question_mark():
-    assert ic.classify("Pourrais-je obtenir le plan détaillé 🤔") == "QUESTION"
+def test_invalid_response_raises_value_error():
+    orchestrator = IntentIngestionOrchestrator(manager=StubManager({"intent": "COMMAND"}))
 
-
-def test_neutral_statement_defaults_to_info():
-    assert ic.classify("Ton humeur semble stable aujourd'hui.") == "INFO"
-
-
-def test_log_uncertain_intent_appends_jsonl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    log_path = tmp_path / "feedback.log"
-    monkeypatch.setattr(ic, "_FEEDBACK_LOG_PATH", log_path)
-    ic.log_uncertain_intent("Salut", "salut", "INFO", 0.42)
-    payload = json.loads(log_path.read_text(encoding="utf-8").strip())
-    assert payload["original"] == "Salut"
-    assert payload["predicted_label"] == "INFO"
-    assert payload["score"] == pytest.approx(0.42, abs=1e-9)
+    with pytest.raises(ValueError):
+        orchestrator.analyze("Exécute le rapport weekly")

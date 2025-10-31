@@ -1,479 +1,430 @@
+"""LLM-first reasoning directive orchestrator.
+
+This module used to combine multiple heuristic strategies (online classifiers,
+scorers, Thompson sampling, etc.) to propose hypotheses, questions and action
+plans.  The refactor collapses everything into a single structured LLM call
+that delivers the complete reasoning directive at once.  The only logic left in
+Python is responsible for light normalisation, dataclass representations and
+compatibility helpers for the rest of the architecture.
+"""
+
 from __future__ import annotations
 
-import abc
-import logging
-import math
-import time
-import unicodedata
-from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
-import re
-
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import LLMIntegrationError, get_llm_manager
 
 
-logger = logging.getLogger(__name__)
+class ReasoningFailure(RuntimeError):
+    """Raised when the reasoning orchestrator cannot complete the LLM workflow."""
 
 
-class ReasoningStrategy(abc.ABC):
-    """Interface minimale pour une stratégie de raisonnement.
+# ---------------------------------------------------------------------------
+# Normalisation helpers
+# ---------------------------------------------------------------------------
 
-    Toutes les stratégies doivent retourner un dictionnaire respectant le contrat
-    documenté ci-dessous. La méthode :meth:`apply` reste abstraite pour forcer
-    les sous-classes à fournir une implémentation explicite et éviter les
-    silences en production.
-    """
+def _normalise_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    text = str(value).strip()
+    return text or None
 
-    name: str = "base"
-    REQUIRED_FIELDS = {"notes", "proposals", "questions", "cost", "time"}
 
-    @abc.abstractmethod
-    def apply(self, prompt: str, context: Dict[str, Any], toolkit: Dict[str, Any]) -> Dict[str, Any]:
-        """Exécute la stratégie et retourne un dictionnaire normalisé.
+def _normalise_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        try:
+            number = float(str(value))
+        except (TypeError, ValueError):
+            return None
+    if number != number:  # NaN
+        return None
+    if number in (float("inf"), float("-inf")):
+        return None
+    return number
 
-        Le dictionnaire doit contenir au minimum les clés suivantes :
 
-        * ``notes`` (``str``)
-        * ``proposals`` (``List[Dict[str, Any]]``)
-        * ``questions`` (``List[str]``)
-        * ``cost`` (``float``)
-        * ``time`` (``float``)
-        """
+def _normalise_sequence(value: Any, *, max_items: int = 12) -> List[str]:
+    if value is None:
+        return []
+    items: List[str] = []
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            items.append(text)
+    elif isinstance(value, Iterable):
+        for entry in value:
+            text = _normalise_text(entry)
+            if text:
+                items.append(text)
+            if len(items) >= max_items:
+                break
+    deduped: List[str] = []
+    seen = set()
+    for item in items:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped[:max_items]
 
-    def validate_output(self, result: Mapping[str, Any]) -> Dict[str, Any]:
-        """Valide la sortie d'une stratégie et renvoie une copie mutable.
 
-        Lève une ``ValueError`` si une clé obligatoire est absente afin de
-        faciliter le débogage en cas de régression.
-        """
+def _normalise_mapping(value: Any, *, max_list_items: int = 16) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    payload: Dict[str, Any] = {}
+    for key, raw in value.items():
+        if raw is None:
+            continue
+        key_str = str(key)
+        if isinstance(raw, Mapping):
+            payload[key_str] = _normalise_mapping(raw, max_list_items=max_list_items)
+            continue
+        if isinstance(raw, (list, tuple, set)):
+            normalised_list: List[Any] = []
+            for item in raw:
+                normalised = _normalise_value(item, max_list_items=max_list_items)
+                if normalised is not None:
+                    normalised_list.append(normalised)
+                if len(normalised_list) >= max_list_items:
+                    break
+            payload[key_str] = normalised_list
+            continue
+        normalised = _normalise_value(raw, max_list_items=max_list_items)
+        if normalised is not None:
+            payload[key_str] = normalised
+    return payload
 
-        missing = self.REQUIRED_FIELDS.difference(result.keys())
-        if missing:
-            raise ValueError(
-                f"La stratégie '{self.name}' doit retourner les clés {self.REQUIRED_FIELDS}, "
-                f"clés manquantes: {sorted(missing)}"
+
+def _normalise_value(value: Any, *, max_list_items: int = 16) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (bool, int)):
+        return int(value)
+    if isinstance(value, float):
+        return _normalise_float(value)
+    if isinstance(value, Mapping):
+        return _normalise_mapping(value, max_list_items=max_list_items)
+    if isinstance(value, (list, tuple, set)):
+        result: List[Any] = []
+        for item in value:
+            normalised = _normalise_value(item, max_list_items=max_list_items)
+            if normalised is not None:
+                result.append(normalised)
+            if len(result) >= max_list_items:
+                break
+        return result
+    text = _normalise_text(value)
+    if text is not None:
+        return text
+    return None
+
+
+def _clamp_confidence(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, number))
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses describing the LLM response
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReasoningQuestion:
+    text: str
+    priority: Optional[int] = None
+    rationale: Optional[str] = None
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "ReasoningQuestion":
+        text = _normalise_text(payload.get("text") or payload.get("question") or payload)
+        if not text:
+            text = "Clarifier le besoin utilisateur"
+        priority = None
+        if "priority" in payload:
+            try:
+                priority = int(payload.get("priority"))
+            except (TypeError, ValueError):
+                priority = None
+        rationale = _normalise_text(payload.get("rationale") or payload.get("notes"))
+        return cls(text=text, priority=priority, rationale=rationale)
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"text": self.text}
+        if self.priority is not None:
+            data["priority"] = int(self.priority)
+        if self.rationale:
+            data["rationale"] = self.rationale
+        return data
+
+
+@dataclass
+class ReasoningAction:
+    label: str
+    utility: Optional[float] = None
+    priority: Optional[int] = None
+    notes: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "ReasoningAction":
+        label = _normalise_text(payload.get("label") or payload.get("action") or payload)
+        if not label:
+            label = "Continuer le raisonnement"
+        utility = _clamp_confidence(_normalise_float(payload.get("utility")))
+        priority = None
+        if "priority" in payload:
+            try:
+                priority = int(payload.get("priority"))
+            except (TypeError, ValueError):
+                priority = None
+        notes = _normalise_sequence(
+            payload.get("notes")
+            or payload.get("rationale")
+            or payload.get("justification")
+            or [],
+            max_items=6,
+        )
+        return cls(label=label, utility=utility, priority=priority, notes=notes)
+
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {"label": self.label}
+        if self.utility is not None:
+            data["utility"] = float(self.utility)
+        if self.priority is not None:
+            data["priority"] = int(self.priority)
+        if self.notes:
+            data["notes"] = list(self.notes)
+        return data
+
+
+@dataclass
+class ReasoningProposal:
+    label: str
+    summary: Optional[str] = None
+    confidence: Optional[float] = None
+    rationale: Optional[str] = None
+    supporting_evidence: List[str] = field(default_factory=list)
+    actions: List[ReasoningAction] = field(default_factory=list)
+    tests: List[Dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "ReasoningProposal":
+        label = _normalise_text(payload.get("label") or payload.get("name") or payload)
+        if not label:
+            label = "Hypothèse"
+        summary = _normalise_text(payload.get("summary") or payload.get("hypothesis"))
+        confidence = _clamp_confidence(_normalise_float(payload.get("confidence")))
+        rationale = _normalise_text(payload.get("rationale") or payload.get("notes"))
+        supporting = _normalise_sequence(payload.get("support") or payload.get("evidence") or [])
+        actions: List[ReasoningAction] = []
+        raw_actions = payload.get("actions")
+        if isinstance(raw_actions, Iterable):
+            for entry in raw_actions:
+                if isinstance(entry, Mapping):
+                    actions.append(ReasoningAction.from_payload(entry))
+        tests: List[Dict[str, Any]] = []
+        raw_tests = payload.get("tests")
+        if isinstance(raw_tests, Iterable):
+            for entry in raw_tests:
+                if isinstance(entry, Mapping):
+                    tests.append(_normalise_mapping(entry))
+        return cls(
+            label=label,
+            summary=summary,
+            confidence=confidence,
+            rationale=rationale,
+            supporting_evidence=supporting,
+            actions=actions,
+            tests=tests,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"label": self.label}
+        if self.summary:
+            payload["summary"] = self.summary
+        if self.confidence is not None:
+            payload["confidence"] = float(self.confidence)
+        if self.rationale:
+            payload["rationale"] = self.rationale
+        if self.supporting_evidence:
+            payload["supporting_evidence"] = list(self.supporting_evidence)
+        if self.actions:
+            payload["actions"] = [action.to_dict() for action in self.actions]
+        if self.tests:
+            payload["tests"] = [dict(test) for test in self.tests]
+        return payload
+
+
+@dataclass
+class ReasoningEpisodeDirective:
+    """Structured reasoning output returned by the LLM orchestrator."""
+
+    summary: str
+    confidence: Optional[float]
+    hypothesis: Dict[str, Any]
+    proposals: List[ReasoningProposal] = field(default_factory=list)
+    tests: List[Dict[str, Any]] = field(default_factory=list)
+    questions: List[ReasoningQuestion] = field(default_factory=list)
+    actions: List[ReasoningAction] = field(default_factory=list)
+    learning: List[str] = field(default_factory=list)
+    notes: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    cost: Optional[float] = None
+    duration: Optional[float] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "ReasoningEpisodeDirective":
+        summary = _normalise_text(payload.get("summary")) or "Synthèse indisponible"
+        confidence = _clamp_confidence(_normalise_float(payload.get("confidence")))
+        hypothesis = _normalise_mapping(payload.get("hypothesis") or {})
+        proposals: List[ReasoningProposal] = []
+        raw_proposals = payload.get("proposals")
+        if isinstance(raw_proposals, Iterable):
+            for entry in raw_proposals:
+                if isinstance(entry, Mapping):
+                    proposals.append(ReasoningProposal.from_payload(entry))
+        tests: List[Dict[str, Any]] = []
+        raw_tests = payload.get("tests")
+        if isinstance(raw_tests, Iterable):
+            for entry in raw_tests:
+                if isinstance(entry, Mapping):
+                    tests.append(_normalise_mapping(entry))
+                else:
+                    text = _normalise_text(entry)
+                    if text:
+                        tests.append({"description": text})
+        questions: List[ReasoningQuestion] = []
+        raw_questions = payload.get("questions") or payload.get("follow_up_questions")
+        if isinstance(raw_questions, Iterable):
+            for entry in raw_questions:
+                if isinstance(entry, Mapping):
+                    questions.append(ReasoningQuestion.from_payload(entry))
+                else:
+                    question_text = _normalise_text(entry)
+                    if question_text:
+                        questions.append(ReasoningQuestion(text=question_text))
+        actions: List[ReasoningAction] = []
+        raw_actions = payload.get("actions")
+        if isinstance(raw_actions, Iterable):
+            for entry in raw_actions:
+                if isinstance(entry, Mapping):
+                    actions.append(ReasoningAction.from_payload(entry))
+                else:
+                    label = _normalise_text(entry)
+                    if label:
+                        actions.append(ReasoningAction(label=label))
+        learning = _normalise_sequence(payload.get("learning") or payload.get("insights") or [])
+        notes = _normalise_text(payload.get("notes") or payload.get("rationale"))
+        metadata = _normalise_mapping(payload.get("metadata") or {})
+        cost = _normalise_float(payload.get("cost"))
+        duration = _normalise_float(payload.get("time") or payload.get("duration"))
+        raw = _normalise_mapping(payload)
+        return cls(
+            summary=summary,
+            confidence=confidence,
+            hypothesis=hypothesis,
+            proposals=proposals,
+            tests=tests,
+            questions=questions,
+            actions=actions,
+            learning=learning,
+            notes=notes,
+            metadata=metadata,
+            cost=cost,
+            duration=duration,
+            raw=raw,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "summary": self.summary,
+            "confidence": self.confidence,
+            "hypothesis": dict(self.hypothesis),
+            "proposals": [proposal.to_dict() for proposal in self.proposals],
+            "tests": [dict(test) for test in self.tests],
+            "questions": [question.to_dict() for question in self.questions],
+            "actions": [action.to_dict() for action in self.actions],
+            "learning": list(self.learning),
+            "notes": self.notes,
+            "metadata": dict(self.metadata),
+            "cost": self.cost,
+            "duration": self.duration,
+            "raw_llm_result": dict(self.raw),
+        }
+        if self.confidence is not None:
+            payload["final_confidence"] = float(self.confidence)
+        else:
+            payload["final_confidence"] = None
+        chosen = self.hypothesis.get("label") or self.hypothesis.get("summary") or self.hypothesis.get("title")
+        if chosen:
+            payload["chosen_hypothesis"] = chosen
+        legacy_tests = []
+        for test in self.tests:
+            text = (
+                _normalise_text(test.get("description"))
+                or _normalise_text(test.get("summary"))
+                or _normalise_text(test.get("label"))
             )
-        out = dict(result)
-        # Garantit des types simples pour les champs principaux.
-        out["notes"] = str(out.get("notes", ""))
-        out.setdefault("proposals", [])
-        out.setdefault("questions", [])
-        out.setdefault("cost", 0.0)
-        out.setdefault("time", 0.0)
-        return out
+            if text:
+                legacy_tests.append(text)
+        if legacy_tests:
+            payload["tests_text"] = legacy_tests
+        if self.notes:
+            payload.setdefault("notes", self.notes)
+        return payload
 
 
-def _normalize_text(text: str) -> str:
-    normalized = unicodedata.normalize("NFD", text or "").lower()
-    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+# ---------------------------------------------------------------------------
+# Public orchestration helper
+# ---------------------------------------------------------------------------
 
-
-def _tokenize(text: str) -> List[str]:
-    return re.findall(r"[a-z0-9_]+", _normalize_text(text))
-
-
-class OnlineIntentClassifier:
-    """Classifieur texte léger mis à jour en ligne.
-
-    Il sert de repli pour générer des questions pertinentes lorsque les règles
-    déterministes ne suffisent pas.
-    """
-
-    LABEL_QUESTIONS = {
-        "definition": ["Quels éléments définissent précisément le concept ?"],
-        "process": ["Quelles étapes composent le processus ?"],
-        "cause": ["Quelles sont les causes ou facteurs déclencheurs ?"],
-        "decision": ["Quels critères permettent de trancher ?"],
-    }
-
-    def __init__(self) -> None:
-        self._weights: Dict[str, defaultdict[str, float]] = {
-            label: defaultdict(float) for label in self.LABEL_QUESTIONS
-        }
-        self._bias: Dict[str, float] = {label: 0.0 for label in self.LABEL_QUESTIONS}
-
-    def _features(self, text: str) -> Dict[str, float]:
-        tokens = _tokenize(text)
-        feats: Dict[str, float] = defaultdict(float)
-        for token in tokens:
-            feats[f"tok::{token}"] += 1.0
-        for i in range(len(tokens) - 1):
-            feats[f"bi::{tokens[i]}_{tokens[i+1]}"] += 1.0
-        # Signaux légers : ponctuation / longueur
-        length_bucket = f"len::{len(text.strip()) // 20}"
-        feats[length_bucket] += 1.0
-        if "?" in text:
-            feats["has_question"] = 1.0
-        if "!" in text:
-            feats["has_exclamation"] = 1.0
-        return feats
-
-    def _score(self, feats: Mapping[str, float], label: str) -> float:
-        weight = self._weights[label]
-        total = self._bias[label]
-        total += sum(weight[f] * value for f, value in feats.items())
-        return total
-
-    def predict(self, text: str) -> Tuple[str, float, Dict[str, float]]:
-        feats = self._features(text)
-        scores = {label: self._score(feats, label) for label in self.LABEL_QUESTIONS}
-        best_label, raw_score = max(scores.items(), key=lambda item: item[1])
-        # Normalisation douce via sigmoïde
-        confidence = 1.0 / (1.0 + math.exp(-raw_score))
-        return best_label, confidence, feats
-
-    def update(self, text: str, label: str, lr: float = 0.1) -> None:
-        if label not in self.LABEL_QUESTIONS:
-            return
-        predicted, _, feats = self.predict(text)
-        target = 1.0
-        for lbl in self.LABEL_QUESTIONS:
-            tgt = target if lbl == label else 0.0
-            score = self._score(feats, lbl)
-            pred = 1.0 / (1.0 + math.exp(-score))
-            error = tgt - pred
-            for feature, value in feats.items():
-                self._weights[lbl][feature] += lr * error * value
-            self._bias[lbl] += lr * error
-        logger.debug("Intent classifier updated towards %s (predicted %s)", label, predicted)
-
-
-class OnlineWeightedScorer:
-    """Petite régression logistique en ligne pour pondérer les hypothèses."""
-
-    def __init__(self) -> None:
-        self._weights: Dict[str, float] = defaultdict(float)
-        self._bias: float = 0.2  # encourage légèrement les synthèses appuyées
-
-    def featurize(
-        self,
-        prompt: str,
-        support: Iterable[str],
-        proposal: Mapping[str, Any],
-    ) -> Dict[str, float]:
-        support_list = list(support)
-        features: Dict[str, float] = {
-            "support_count": float(len(support_list)),
-            "support_chars": float(sum(len(s) for s in support_list)) / 100.0,
-            "answer_chars": float(len((proposal.get("answer") or "").strip())) / 80.0,
-            "has_support": 1.0 if support_list else 0.0,
-            "question_marks": (proposal.get("answer") or "").count("?") * -0.5,
-        }
-        prompt_tokens = _tokenize(prompt)
-        features["prompt_len"] = float(len(prompt_tokens)) / 10.0
-        if "plan" in prompt_tokens:
-            features["topic_plan"] = 1.0
-        if "pourquoi" in prompt_tokens or "why" in prompt_tokens:
-            features["topic_cause"] = 1.0
-        return features
-
-    def _linear(self, features: Mapping[str, float]) -> float:
-        score = self._bias
-        for key, value in features.items():
-            score += self._weights[key] * value
-        return score
-
-    def score(self, features: Mapping[str, float]) -> float:
-        return 1.0 / (1.0 + math.exp(-self._linear(features)))
-
-    def update(self, features: Mapping[str, float], accepted: bool, lr: float = 0.15) -> None:
-        prediction = self.score(features)
-        target = 1.0 if accepted else 0.0
-        error = target - prediction
-        for key, value in features.items():
-            self._weights[key] += lr * error * value
-        self._bias += lr * error
-        logger.debug(
-            "Hypothesis scorer update: accepted=%s, error=%.4f, bias=%.4f",
-            accepted,
-            error,
-            self._bias,
-        )
-
-
-def _get_intent_classifier(toolkit: MutableMapping[str, Any]) -> OnlineIntentClassifier:
-    classifier = toolkit.get("intent_classifier")
-    if not isinstance(classifier, OnlineIntentClassifier):
-        classifier = OnlineIntentClassifier()
-        toolkit["intent_classifier"] = classifier
-    return classifier
-
-
-def _get_hypothesis_scorer(toolkit: MutableMapping[str, Any]) -> OnlineWeightedScorer:
-    scorer = toolkit.get("hypothesis_scorer")
-    if not isinstance(scorer, OnlineWeightedScorer):
-        scorer = OnlineWeightedScorer()
-        toolkit["hypothesis_scorer"] = scorer
-    return scorer
-
-
-# ---------- 1) Décomposition (sous-problèmes) ----------
-class DecompositionStrategy(ReasoningStrategy):
-    name = "décomposition"
-
-    def apply(self, prompt: str, context: Dict[str, Any], toolkit: Dict[str, Any]) -> Dict[str, Any]:
-        t0 = time.time()
-        questions: List[str] = []
-        txt = (prompt or "").strip()
-
-        classifier = _get_intent_classifier(toolkit)
-        feedback_label = context.get("intent_feedback")
-        if isinstance(feedback_label, str):
-            classifier.update(txt, feedback_label)
-
-        lower = _normalize_text(txt).replace("'", "")
-        tokens = _tokenize(txt)
-
-        # Heuristiques robustifiées
-        if re.search(r"\b(pourquoi|why)\b", lower):
-            questions.append("Quelles sont les causes plausibles ?")
-            questions.append("Quelles preuves observez-vous ?")
-        if re.search(r"\b(comment|how)\b", lower):
-            questions.append("Quelles sont les étapes pour y parvenir ?")
-            questions.append("Quels obstacles et hypothèses ?")
-        if re.search(r"\best\s+(?:un|une|le|la|l)\b", lower) or (
-            "est" in tokens and {"un", "une", "le", "la", "l"}.intersection(tokens)
-        ):
-            questions.append("Quelles sont les caractéristiques essentielles du concept ?")
-
-        key = list(dict.fromkeys([t for t in tokens if len(t) > 4]))[:5]
-        if key:
-            questions.append(f"Définir/clarifier: {', '.join(key[:3])}")
-
-        if not questions:
-            predicted, confidence, _ = classifier.predict(txt)
-            generated = classifier.LABEL_QUESTIONS.get(predicted, [])
-            questions.extend(generated)
-            if confidence < 0.55:
-                questions.append("Quel est l'objectif précis à atteindre ?")
-
-        notes = "Sous-problèmes identifiés" if questions else "Pas de sous-problèmes saillants"
-        return self.validate_output(
-            {
-                "notes": notes,
-                "proposals": [],
-                "questions": questions,
-                "cost": 0.5,
-                "time": time.time() - t0,
-            }
-        )
-
-
-# ---------- 2) Récupération d'évidence (mémoire/doc) ----------
-class EvidenceRetrievalStrategy(ReasoningStrategy):
-    name = "récupération"
-
-    def apply(self, prompt: str, context: Dict[str, Any], toolkit: Dict[str, Any]) -> Dict[str, Any]:
-        t0 = time.time()
-        retrieve = toolkit.get("retrieve_fn")
-        supports: List[str] = []
-
-        if retrieve:
-            # cherche 4 items (interactions/docs)
-            hits = retrieve(prompt, top_k=4)
-            for h in hits:
-                title = h.get("meta", {}).get("title") or h.get("meta", {}).get("type", "")
-                snippet = h.get("text", "")
-                if len(snippet) > 220:
-                    snippet = snippet[:220] + "…"
-                label = f"{title}: {snippet}" if title else snippet
-                supports.append(label)
-
-        notes = "Évidence récupérée depuis la mémoire" if supports else "Aucune évidence en mémoire"
-        return self.validate_output(
-            {
-                "notes": notes,
-                "proposals": [],  # pas de proposition finale ici, juste du support
-                "questions": [],
-                "cost": 1.0,
-                "time": time.time() - t0,
-                "support": supports,
-            }
-        )
-
-
-# ---------- 3) Génération / ranking d'hypothèses ----------
-class HypothesisRankingStrategy(ReasoningStrategy):
-    name = "hypothèses"
-
-    def apply(self, prompt: str, context: Dict[str, Any], toolkit: Dict[str, Any]) -> Dict[str, Any]:
-        t0 = time.time()
-        support_snippets: List[str] = list(context.get("support", []))
-        proposals: List[Dict[str, Any]] = []
-
-        scorer = _get_hypothesis_scorer(toolkit)
-        memory: Dict[str, Dict[str, float]] = toolkit.setdefault("hypothesis_memory", {})
-
-        feedback_items = context.get("hypothesis_feedback")
-        if isinstance(feedback_items, list):
-            for item in feedback_items:
-                if not isinstance(item, Mapping):
-                    continue
-                answer = item.get("answer")
-                if not isinstance(answer, str):
-                    continue
-                features = memory.get(answer)
-                if not features:
-                    continue
-                accepted = bool(item.get("accepted"))
-                scorer.update(features, accepted)
-
-        if support_snippets:
-            joined = " | ".join(support_snippets[:3])
-            ans = f"Synthèse appuyée sur mémoire: {joined}"
-            proposals.append({"answer": ans, "support": support_snippets[:3]})
-
-        if not proposals:
-            classifier = _get_intent_classifier(toolkit)
-            predicted, _, _ = classifier.predict(prompt)
-            if predicted == "process":
-                fallback = "Sans éléments externes, détaillons un plan en étapes et validons chaque contrainte."
-            elif predicted == "cause":
-                fallback = "Faute d'évidence, listons les causes plausibles et vérifions les indices."
-            else:
-                fallback = "Je manque d'évidence directe. Je propose d'éclaircir le but et les contraintes."
-            proposals.append({"answer": fallback, "support": []})
-
-        for proposal in proposals:
-            features = scorer.featurize(prompt, support_snippets, proposal)
-            memory[proposal["answer"]] = features
-            confidence = 0.1 + 0.8 * scorer.score(features)
-            proposal["confidence"] = max(0.0, min(1.0, confidence))
-
-        return self.validate_output(
-            {
-                "notes": "Hypothèses construites et pondérées",
-                "proposals": proposals,
-                "questions": [],
-                "cost": 0.8,
-                "time": time.time() - t0,
-            }
-        )
-
-
-# ---------- 4) Auto-vérification légère ----------
-class SelfCheckStrategy(ReasoningStrategy):
-    name = "auto-vérification"
-
-    def apply(self, prompt: str, context: Dict[str, Any], toolkit: Dict[str, Any]) -> Dict[str, Any]:
-        t0 = time.time()
-        proposals: List[Dict[str, Any]] = context.get("proposals", [])
-        last_answer = context.get("last_answer", "")
-        notes = "Aucune contradiction apparente"
-
-        normalized_last = _normalize_text(last_answer)
-        contradictions = [
-            ("oui", "non"),
-            ("vrai", "faux"),
-            ("possible", "impossible"),
-            ("peut", "nepeutpas"),
-            ("autorise", "interdit"),
-        ]
-        for p in proposals:
-            answer_norm = _normalize_text(p.get("answer") or "")
-            for x, y in contradictions:
-                if x in answer_norm and y in normalized_last:
-                    p["confidence"] *= 0.8
-                    notes = "Contradiction détectée avec l'itération précédente (pondération réduite)"
-                if y in answer_norm and x in normalized_last:
-                    p["confidence"] *= 0.8
-                    notes = "Contradiction détectée avec l'itération précédente (pondération réduite)"
-
-        # clamp
-        for p in proposals:
-            p["confidence"] = max(0.0, min(1.0, float(p["confidence"])))
-
-        return self.validate_output(
-            {
-                "notes": notes,
-                "proposals": proposals,
-                "questions": [],
-                "cost": 0.2,
-                "time": time.time() - t0,
-            }
-        )
-
-
-def plan_reasoning_strategy(
+def run_reasoning_episode(
+    *,
     prompt: str,
     context: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Choisit une stratégie de raisonnement adaptée en combinant LLM et heuristiques."""
+    toolkit: Optional[Mapping[str, Any]] = None,
+    llm_manager: Any | None = None,
+) -> ReasoningEpisodeDirective:
+    """Execute the reasoning LLM contract once and return a structured directive."""
 
-    context_snapshot = {}
-    if isinstance(context, Mapping):
-        context_snapshot = {
-            key: value
-            for key, value in context.items()
-            if isinstance(value, (str, int, float, bool))
-        }
-
-    llm_plan = try_call_llm_dict(
-        "reasoning_strategies",
-        input_payload={"prompt": prompt, "context": context_snapshot},
-        logger=logger,
-    )
-    if llm_plan:
-        strategy = str(llm_plan.get("strategy") or "").strip()
-        steps_raw = llm_plan.get("steps")
-        steps: List[Dict[str, Any]] = []
-        if isinstance(steps_raw, list):
-            for item in steps_raw:
-                if not isinstance(item, Mapping):
-                    continue
-                description = str(item.get("description") or "").strip()
-                confidence = item.get("confidence")
-                try:
-                    numeric_conf = max(0.0, min(1.0, float(confidence)))
-                except (TypeError, ValueError):
-                    numeric_conf = 0.5
-                if description:
-                    steps.append({"description": description, "confidence": numeric_conf})
-        notes = str(llm_plan.get("notes") or "")
-        if strategy or steps:
-            return {
-                "strategy": strategy or _fallback_plan_key(prompt),
-                "steps": steps or _fallback_plan_steps(prompt),
-                "notes": notes,
-            }
-
-    return {
-        "strategy": _fallback_plan_key(prompt),
-        "steps": _fallback_plan_steps(prompt),
-        "notes": "plan issu des heuristiques locales",
-    }
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("reasoning prompt must be a non-empty string")
+    payload: Dict[str, Any] = {"prompt": prompt.strip()}
+    if context:
+        context_payload = _normalise_mapping(context)
+        if context_payload:
+            payload["context"] = context_payload
+    if toolkit:
+        toolkit_payload = _normalise_mapping(toolkit)
+        if toolkit_payload:
+            payload["toolkit"] = toolkit_payload
+    manager = llm_manager or get_llm_manager()
+    try:
+        response = manager.call_dict("reasoning_episode", input_payload=payload)
+    except LLMIntegrationError as exc:  # pragma: no cover - defensive
+        raise ReasoningFailure(f"reasoning_episode failed: {exc}") from exc
+    if not isinstance(response, Mapping):
+        raise ReasoningFailure("reasoning_episode returned an invalid payload")
+    return ReasoningEpisodeDirective.from_payload(response)
 
 
-def _fallback_plan_key(prompt: str) -> str:
-    normalized = _normalize_text(prompt)
-    if any(token in normalized for token in ("pourquoi", "cause", "why")):
-        return "analyse_causale"
-    if any(token in normalized for token in ("comment", "plan", "how", "étapes", "etapes")):
-        return "planification"
-    if "verifier" in normalized or "check" in normalized:
-        return "auto_verification"
-    return "clarification"
-
-
-def _fallback_plan_steps(prompt: str) -> List[Dict[str, Any]]:
-    key = _fallback_plan_key(prompt)
-    if key == "analyse_causale":
-        return [
-            {"description": "Lister les causes plausibles", "confidence": 0.7},
-            {"description": "Comparer avec les observations connues", "confidence": 0.6},
-        ]
-    if key == "planification":
-        return [
-            {"description": "Décomposer la tâche en étapes", "confidence": 0.65},
-            {"description": "Identifier obstacles et ressources", "confidence": 0.55},
-        ]
-    if key == "auto_verification":
-        return [
-            {"description": "Comparer avec la réponse précédente", "confidence": 0.6},
-            {"description": "Chercher contradictions majeures", "confidence": 0.5},
-        ]
-    return [
-        {"description": "Clarifier l'objectif et les contraintes", "confidence": 0.6},
-        {"description": "Identifier les informations manquantes", "confidence": 0.5},
-    ]
+__all__ = [
+    "ReasoningAction",
+    "ReasoningEpisodeDirective",
+    "ReasoningFailure",
+    "ReasoningProposal",
+    "ReasoningQuestion",
+    "run_reasoning_episode",
+]

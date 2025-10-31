@@ -7,54 +7,49 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from AGI_Evolutive.io import intent_classifier as ic
+from AGI_Evolutive.io.intent_classifier import IntentIngestionOrchestrator  # noqa: E402
 
 
-class StubManager:
-    def __init__(self, payload):
-        self.payload = payload
-        self.last_spec = None
-        self.last_payload = None
+class RecordingManager:
+    def __init__(self, response):
+        self.response = response
+        self.records = []
 
-    def call_dict(self, spec_key, *, input_payload=None, **_kwargs):
-        self.last_spec = spec_key
-        self.last_payload = input_payload
-        return self.payload
+    def call_dict(self, spec_key, *, input_payload=None, **kwargs):
+        self.records.append({"spec": spec_key, "payload": input_payload, "kwargs": kwargs})
+        return self.response
 
 
-def _empty_patterns():
-    return {"THREAT": [], "QUESTION": [], "COMMAND": []}
+def test_orchestrator_passes_metadata_and_parses_flags():
+    manager = RecordingManager(
+        {
+            "intent": {"label": "command", "confidence": 0.88, "rationale": "Demande explicite d'action."},
+            "tone": "direct",
+            "sentiment": "neutral",
+            "priority": "high",
+            "urgency": "immédiat",
+            "summary": "Exécuter une sauvegarde complète",
+            "follow_up_questions": [],
+            "safety": {"flags": ["requires_confirmation", "policy_alert"]},
+        }
+    )
+    orchestrator = IntentIngestionOrchestrator(manager=manager)
+
+    result = orchestrator.analyze(
+        "Lance immédiatement une sauvegarde complète.",
+        context={"channel": "terminal"},
+        metadata={"conversation_id": "abc-123"},
+    )
+
+    assert result.label == "COMMAND"
+    assert result.safety_flags == ("requires_confirmation", "policy_alert")
+    assert manager.records[0]["spec"] == "intent_ingestion"
+    assert manager.records[0]["payload"]["metadata"] == {"conversation_id": "abc-123"}
 
 
-def test_llm_classification_overrides_when_confident(monkeypatch):
-    manager = StubManager({"intent": "command", "confidence": 0.92})
-    monkeypatch.setattr(ic, "_llm_enabled", lambda: True)
-    monkeypatch.setattr(ic, "_llm_manager", lambda: manager)
-    monkeypatch.setattr(ic, "_get_patterns", _empty_patterns)
-    monkeypatch.setattr(ic, "_load_fallback_model", lambda: None)
-    monkeypatch.setattr(ic, "_classify_with_fallback", lambda original, normalized: "INFO")
-    monkeypatch.setattr(ic, "log_uncertain_intent", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ic, "_log_llm_decision", lambda *args, **kwargs: None)
+def test_missing_intent_mapping_raises():
+    manager = RecordingManager({"tone": "calm"})
+    orchestrator = IntentIngestionOrchestrator(manager=manager)
 
-    label = ic.classify("merci de lancer backup manuel")
-
-    assert label == "COMMAND"
-    assert manager.last_spec == "intent_classification"
-    assert manager.last_payload["utterance"] == "merci de lancer backup manuel"
-
-
-def test_llm_rejects_low_confidence(monkeypatch):
-    manager = StubManager({"intent": "info", "confidence": 0.2})
-    monkeypatch.setattr(ic, "_llm_enabled", lambda: True)
-    monkeypatch.setattr(ic, "_llm_manager", lambda: manager)
-    monkeypatch.setattr(ic, "_get_patterns", _empty_patterns)
-    monkeypatch.setattr(ic, "_load_fallback_model", lambda: None)
-    monkeypatch.setattr(ic, "_classify_with_fallback", lambda original, normalized: "INFO")
-    logged = {}
-    monkeypatch.setattr(ic, "log_uncertain_intent", lambda *args, **kwargs: logged.setdefault("called", True))
-    monkeypatch.setattr(ic, "_log_llm_decision", lambda *args, **kwargs: None)
-
-    label = ic.classify("analyse le document joint")
-
-    assert label == "INFO"
-    assert logged.get("called") is True
+    with pytest.raises(ValueError):
+        orchestrator.analyze("Bonjour")

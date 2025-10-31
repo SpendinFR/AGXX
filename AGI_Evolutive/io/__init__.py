@@ -33,19 +33,16 @@ _INTERFACE_TEMPLATES: Sequence[Mapping[str, Any]] = (
     {
         "name": "intent",
         "module": "AGI_Evolutive.io.intent_classifier",
-        "summary_hint": "Classification d'intentions avec règles et LLM en surcouche.",
-        "status": "stable",
-        "entrypoints": ["classify", "log_uncertain_intent"],
-        "llm_hooks": ["intent_classification"],
+        "summary_hint": "Ingestion d'intention unifiée via un seul appel LLM.",
+        "status": "refactored",
+        "entrypoints": ["IntentIngestionOrchestrator", "analyze"],
+        "llm_hooks": ["intent_ingestion"],
         "responsibilities": (
-            "Détecter la classe d'intention",
-            "Journaliser les cas incertains",
-            "Combiner heuristiques et modèle ML léger",
+            "Analyser l'énoncé brut et le contexte",
+            "Produire intent, tonalité, priorité, sécurité et résumés",
+            "Distribuer un contrat JSON unique aux couches aval",
         ),
-        "fallback_capabilities": (
-            "Regex et patronage multiclasse",
-            "Modèle JSON entraîné offline",
-        ),
+        "fallback_capabilities": (),
     },
     {
         "name": "action",
@@ -107,21 +104,21 @@ def _build_baseline_snapshot(
     interfaces = [_build_interface_entry(template) for template in _INTERFACE_TEMPLATES]
 
     summary = (
-        "Le sous-système I/O relie perception, classification d'intentions et "
-        "passerelle d'action avec supervision LLM optionnelle."
+        "Le sous-système I/O relie perception, ingestion LLM des intentions et "
+        "passerelle d'action sous pilotage unifié."
     )
     risks: List[Mapping[str, Any]] = [
         {
-            "label": "Intent_classifier reste majoritairement heuristique",
+            "label": "Surveiller la latence et la disponibilité du service intent_ingestion",
             "severity": "medium",
         },
         {
-            "label": "Journalisation inbox volumineuse",
+            "label": "S'assurer que les métadonnées (tone/urgency) sont bien consommées en aval",
             "severity": "low",
         },
     ]
     recommended_actions: List[str] = [
-        "Auditer la précision LLM vs heuristique sur intent_classifier",
+        "Échantillonner les réponses intent_ingestion pour vérifier la cohérence du contrat",
         "Consolider la télémétrie perception_preprocess",
     ]
 

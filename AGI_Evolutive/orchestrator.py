@@ -2262,7 +2262,14 @@ class Orchestrator:
             except Exception:
                 pass
 
-        if not (jm and jm.has_urgent()):
+        if not (
+            jm
+            and (
+                jm.has_urgent()
+                or (hasattr(jm, "has_urgent_context") and jm.has_urgent_context())
+                or (hasattr(jm, "current_thread_is_urgent") and jm.current_thread_is_urgent())
+            )
+        ):
             self.scheduler.tick()
         if jm is not None:
             jm.drain_to_memory(self._memory_store)

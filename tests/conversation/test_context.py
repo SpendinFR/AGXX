@@ -1,121 +1,121 @@
-import pathlib
+from __future__ import annotations
+
 import sys
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from AGI_Evolutive.conversation.context import ContextBuilder, OnlineTopicClassifier
+from AGI_Evolutive.conversation import context  # noqa: E402
+from AGI_Evolutive.utils.llm_service import LLMIntegrationError  # noqa: E402
 
 
 class DummyMemory:
-    def __init__(self, memories):
-        self._memories = list(memories)
+    def __init__(self, records):
+        self._records = list(records)
 
-    def get_recent_memories(self, n=100):
-        return list(self._memories)[-n:]
+    def get_recent_memories(self, n: int = 10):
+        return list(self._records)[-n:]
 
 
 class DummyUserModel:
-    def __init__(self, persona=None, user_id="user-1"):
+    def __init__(self, persona=None):
         self._persona = persona or {}
-        self._user_id = user_id
 
     def describe(self):
-        return {"id": self._user_id, "persona": self._persona}
+        return {"id": "user-123", "persona": self._persona}
 
 
-class DummyArch:
-    def __init__(self, memories, persona=None):
-        self.memory = DummyMemory(memories)
-        self.user_model = DummyUserModel(persona=persona)
-        self.consolidator = type("Consolidator", (), {"state": {"lessons": ["note A", "note B"]}})()
-        self.related_index = None
+class StubLLM:
+    def __init__(self, payload):
+        self.payload = payload
+        self.last_spec = None
+        self.last_input = None
+
+    def call_dict(self, spec_key, *, input_payload=None, **_: object):
+        self.last_spec = spec_key
+        self.last_input = input_payload or {}
+        return self.payload
 
 
-def _make_msg(text, ts=None, kind="interaction", tags=None):
-    if ts is None:
-        ts = time.time()
+def _record(text, *, speaker="user", ts=None, kind="interaction", tags=None):
     return {
         "text": text,
+        "speaker": speaker,
+        "ts": time.time() if ts is None else ts,
         "kind": kind,
-        "memory_type": kind,
         "tags": tags or [],
-        "ts": ts,
     }
 
 
-def test_ttl_selection_and_monitoring_updates():
-    base = time.time() - 6 * 86400
-    memories = [
-        _make_msg("premier échange", ts=base + i * 86400) for i in range(6)
+def test_context_builder_collects_recent_messages_and_persona(monkeypatch):
+    records = [
+        _record("Salut !", speaker="user", tags=["greeting"]),
+        _record("Hello", speaker="assistant", tags=["reply"]),
     ]
-    arch = DummyArch(memories)
-    builder = ContextBuilder(arch)
+    arch = SimpleNamespace(
+        memory=DummyMemory(records),
+        consolidator=SimpleNamespace(state={"lessons": ["priorité aux tests"]}),
+        user_model=DummyUserModel(persona={"tone": "warm"}),
+    )
 
-    ctx = builder.build("ping")
+    llm_response = {
+        "summary": ["Conversation cordiale"],
+        "topics": [
+            {"rank": 1, "label": "salutations"},
+            {"rank": 2, "label": "tests"},
+        ],
+        "key_moments": ["Salut -> Hello"],
+        "user_style": {"prefers_long": False},
+        "follow_up_questions": ["Comment puis-je aider davantage ?"],
+        "recommended_actions": [{"label": "Proposer un plan"}],
+        "alerts": ["Aucun"],
+        "tone": "chaleureux",
+    }
+    stub = StubLLM(llm_response)
+    builder = context.ContextBuilder(arch, llm_manager=stub)
 
-    ttl_info = ctx["monitoring"]["ttl"]["interaction"]
-    assert ttl_info["days"] in ContextBuilder.TTL_OPTIONS_DAYS
-    assert ttl_info["days"] == 3  # intervals ≈ 1 jour ⇒ demi-vie la plus proche : 3 jours
-    assert ctx["active_thread"]
+    result = builder.build("Peux-tu m'aider ?")
 
-
-def test_topics_handle_french_structures_and_classifier():
-    now = time.time()
-    memories = [
-        _make_msg("C'est une Innovation majeure pour l'équipe", ts=now - 60),
-        _make_msg("Analyse des métriques financières", ts=now - 30),
-    ]
-    arch = DummyArch(memories)
-    builder = ContextBuilder(arch)
-
-    topics = builder._topics(memories)
-    assert "innovation" in topics
-    assert "analyse" in topics
-
-
-def test_user_style_persona_overrides():
-    now = time.time()
-    memories = [
-        _make_msg("Message très long " + ("x" * 140), ts=now - 120),
-        _make_msg("Une question?", ts=now - 60),
-    ]
-    persona = {"tone": "verbose-analytical", "values": {"curiosity": 0.8}}
-    arch = DummyArch(memories, persona=persona)
-    builder = ContextBuilder(arch)
-
-    ctx = builder.build("Salut")
-    style = ctx["user_style"]
-    assert style["prefers_long"] is True
-    assert style["asks_questions"] is True
+    assert stub.last_spec == "conversation_context"
+    assert stub.last_input["last_message"] == "Peux-tu m'aider ?"
+    assert stub.last_input["persona"]["persona"]["tone"] == "warm"
+    assert stub.last_input["lessons"] == ["priorité aux tests"]
+    assert result["topics"] == ["salutations", "tests"]
+    assert result["llm_topics"][0]["rank"] == 1
+    assert result["user_style"]["prefers_long"] is False
+    assert result["follow_up_questions"] == ["Comment puis-je aider davantage ?"]
+    assert result["recommended_actions"][0]["label"] == "Proposer un plan"
+    assert result["tone"] == "chaleureux"
+    assert result["llm_summary"]["summary"] == ["Conversation cordiale"]
 
 
-def test_sequence_motifs_detection():
-    base = time.time()
-    texts = [
-        "Plan d'action pour le projet",
-        "Plan d'action détaillé",
-        "Plan d'action validé",
-        "Analyse finale",
-    ]
-    memories = [_make_msg(txt, ts=base + idx * 120) for idx, txt in enumerate(texts)]
-    arch = DummyArch(memories)
-    builder = ContextBuilder(arch)
+def test_context_builder_normalises_sparse_payload(monkeypatch):
+    arch = SimpleNamespace(memory=DummyMemory([_record("ok")]), consolidator=None, user_model=None)
+    stub = StubLLM({"summary": "Brève"})
+    builder = context.ContextBuilder(arch, llm_manager=stub)
 
-    ctx = builder.build("ok")
-    motifs = ctx["sequence_motifs"]
-    assert any("plan → d" in motif or "plan → action" in motif for motif in motifs)
+    result = builder.build("   ok   ")
+
+    assert result["last_message"] == "ok"
+    assert result["summary"] == ["Brève"]
+    assert result["summary_text"] == "Brève"
+    assert result["topics"] == []
+    assert result["user_style"] == {}
 
 
-def test_online_topic_classifier_updates():
-    clf = OnlineTopicClassifier()
-    txt = "Analyse des données financières !"
-    clf.observe(txt, ["analyse", "données"])
-    score = clf.score("analyse")
-    assert score > 0.5
-    fallback = clf.fallback_topics("Analyse complémentaire des données", exclude=[], top_k=2)
-    assert "analyse" in fallback
+def test_context_builder_raises_on_llm_error(monkeypatch):
+    class FailingLLM:
+        def call_dict(self, *_, **__):
+            raise LLMIntegrationError("offline")
+
+    arch = SimpleNamespace(memory=DummyMemory([]), consolidator=None, user_model=None)
+    builder = context.ContextBuilder(arch, llm_manager=FailingLLM())
+
+    with pytest.raises(context.ConversationContextError):
+        builder.build("hello")

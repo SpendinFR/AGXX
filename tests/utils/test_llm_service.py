@@ -47,23 +47,24 @@ class DummyClient:
 def test_call_disabled_raises_unavailable():
     manager = LLMIntegrationManager(client=DummyClient({}), enabled=False)
     with pytest.raises(LLMUnavailableError):
-        manager.call_json("intent_classification")
+        manager.call_json("intent_ingestion")
 
 
 def test_call_dict_returns_mapping_and_instructions():
-    client = DummyClient({"intent": "QUESTION", "confidence": 0.9})
+    client = DummyClient({"intent": {"label": "QUESTION", "confidence": 0.9}})
     manager = LLMIntegrationManager(client=client, enabled=True)
 
     payload = {"utterance": "Peux-tu m'aider ?"}
-    data = manager.call_dict("intent_classification", input_payload=payload)
+    data = manager.call_dict("intent_ingestion", input_payload=payload)
 
-    assert data["intent"] == "QUESTION"
+    assert data["intent"]["label"] == "QUESTION"
     assert client.calls, "The dummy client should have been invoked"
     instructions = client.calls[0]["extra_instructions"]
     assert any("incertitude" in instruction for instruction in instructions)
     example_output = client.calls[0]["example_output"]
     assert isinstance(example_output, dict)
-    assert "class_probabilities" in example_output
+    assert "intent" in example_output
+    assert "summary" in example_output
 
 
 def test_singleton_override_roundtrip(monkeypatch):
@@ -81,19 +82,19 @@ def test_try_call_llm_dict_handles_disabled(monkeypatch):
     original = get_llm_manager()
     try:
         set_llm_manager(manager)
-        assert try_call_llm_dict("intent_classification", input_payload={"x": 1}) is None
+        assert try_call_llm_dict("intent_ingestion", input_payload={"x": 1}) is None
     finally:
         set_llm_manager(original)
 
 
 def test_try_call_llm_dict_returns_mapping(monkeypatch):
-    client = DummyClient({"intent": "INFO", "confidence": 0.51})
+    client = DummyClient({"intent": {"label": "INFO", "confidence": 0.51}})
     manager = LLMIntegrationManager(client=client, enabled=True)
     original = get_llm_manager()
     try:
         set_llm_manager(manager)
-        result = try_call_llm_dict("intent_classification", input_payload={"utterance": "test"})
-        assert result == {"intent": "INFO", "confidence": 0.51}
+        result = try_call_llm_dict("intent_ingestion", input_payload={"utterance": "test"})
+        assert result == {"intent": {"label": "INFO", "confidence": 0.51}}
         assert client.calls, "LLM client should be invoked via helper"
     finally:
         set_llm_manager(original)

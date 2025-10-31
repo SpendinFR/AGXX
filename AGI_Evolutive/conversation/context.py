@@ -1,618 +1,323 @@
+"""LLM-first conversation context builder.
+
+This module collapses the historical heuristic stack (TTL caches, online topic
+learning, persona overrides, sequence mining, etc.) into a single structured
+LLM call.  The builder now gathers the minimal conversational state (recent
+messages, persona hints, consolidated lessons) and delegates the full
+contextualisation work to the model.  The returned payload is normalised and
+exposed through a compact dictionary for the rest of the runtime.
+"""
+
 from __future__ import annotations
 
-import logging
-import math
-import re
-import time
 import unicodedata
-import datetime as dt
-from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
-from itertools import islice
-from typing import Any, Deque, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 
-from AGI_Evolutive.utils.llm_service import (
-    LLMIntegrationError,
-    LLMUnavailableError,
-    get_llm_manager,
-    is_llm_enabled,
-)
+from AGI_Evolutive.utils.llm_service import LLMIntegrationError, get_llm_manager
 
 
-logger = logging.getLogger(__name__)
-
-
-def _llm_enabled() -> bool:
-    return is_llm_enabled()
-
-
-def _llm_manager():
-    return get_llm_manager()
-
-
-def _fmt_date(ts: float) -> str:
-    try:
-        return dt.datetime.fromtimestamp(ts).strftime("%d/%m/%Y")
-    except Exception:
-        return "?"
-
-
-def _now() -> float:
-    return time.time()
-
-
-def _safe_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
+class ConversationContextError(RuntimeError):
+    """Raised when the LLM conversation context cannot be produced."""
 
 
 def _normalize_text(text: str) -> str:
-    text = unicodedata.normalize("NFKC", text or "")
-    return text.strip()
+    normalized = unicodedata.normalize("NFKC", text or "")
+    return normalized.strip()
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return number
+
+
+def _coerce_string(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _coerce_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    result: List[str] = []
+    if isinstance(value, Iterable):
+        for item in value:
+            if isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    result.append(cleaned)
+    return result
+
+
+def _coerce_mapping(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(key): val for key, val in value.items()}
+
+
+def _coerce_action_list(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, Iterable):
+        return []
+    actions: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            action = {str(k): v for k, v in item.items()}
+            if action:
+                actions.append(action)
+    return actions
 
 
 @dataclass
-class _TTLCacheEntry:
-    ttl_index: int
-    ttl_seconds: float
-    updated_at: float
+class ConversationMessage:
+    """Snapshot of a recent conversational exchange."""
+
+    speaker: Optional[str]
+    text: str
+    ts: Optional[float] = None
+    kind: Optional[str] = None
+    tags: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_memory(cls, memo: Mapping[str, Any]) -> "ConversationMessage":
+        speaker = _coerce_string(
+            memo.get("speaker")
+            or memo.get("role")
+            or memo.get("author")
+            or memo.get("source")
+        )
+        text = _normalize_text(str(memo.get("text") or memo.get("content") or ""))
+        ts = _coerce_float(memo.get("ts") or memo.get("timestamp") or memo.get("t"))
+        kind = _coerce_string(memo.get("kind") or memo.get("memory_type"))
+        raw_tags = memo.get("tags")
+        tags = [tag for tag in _coerce_string_list(raw_tags)]
+        return cls(speaker=speaker, text=text, ts=ts, kind=kind, tags=tags)
+
+    def to_payload(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"text": self.text}
+        if self.speaker:
+            payload["speaker"] = self.speaker
+        if self.ts is not None:
+            payload["ts"] = self.ts
+        if self.kind:
+            payload["kind"] = self.kind
+        if self.tags:
+            payload["tags"] = list(self.tags)
+        return payload
 
 
-class OnlineTopicClassifier:
-    """Very small online learner leveraging n-grams and punctuation.
+@dataclass
+class LLMConversationContext:
+    """Normalised view of the LLM response."""
 
-    It behaves as a permissive fallback when heuristic keyword extraction
-    misses salient content.  The implementation purposefully remains
-    lightweight to avoid introducing heavy ML dependencies while still
-    honouring the "online" requirement (continuous updates at inference
-    time).
-    """
+    last_message: str
+    recent_messages: List[ConversationMessage]
+    summary_bullets: List[str] = field(default_factory=list)
+    summary_text: Optional[str] = None
+    topics: List[str] = field(default_factory=list)
+    topics_meta: List[Mapping[str, Any]] = field(default_factory=list)
+    key_moments: List[str] = field(default_factory=list)
+    user_style: Dict[str, Any] = field(default_factory=dict)
+    follow_up_questions: List[str] = field(default_factory=list)
+    recommended_actions: List[Dict[str, Any]] = field(default_factory=list)
+    alerts: List[str] = field(default_factory=list)
+    tone: Optional[str] = None
+    notes: List[str] = field(default_factory=list)
+    meta: Dict[str, Any] = field(default_factory=dict)
+    raw: MutableMapping[str, Any] = field(default_factory=dict)
 
-    def __init__(self, learning_rate: float = 0.12, decay: float = 0.997) -> None:
-        self.learning_rate = float(max(0.01, learning_rate))
-        self.decay = float(min(0.999, max(0.9, decay)))
-        self.bias: float = 0.0
-        self.feature_weights: Dict[str, float] = defaultdict(float)
-        self.token_memory: Counter[str] = Counter()
-        self._last_decay_ts: float = _now()
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        last_message: str,
+        recent_messages: List[ConversationMessage],
+    ) -> "LLMConversationContext":
+        if not isinstance(payload, Mapping):
+            raise ConversationContextError("LLM payload must be a mapping")
 
-    # ---- Feature extraction -------------------------------------------------
-    def _tokenize(self, text: str) -> List[str]:
-        cleaned = _normalize_text(text).lower()
-        words = re.findall(r"[\w'’]{2,}", cleaned, flags=re.UNICODE)
-        return words
+        summary_field = payload.get("summary")
+        summary_bullets = _coerce_string_list(summary_field)
+        summary_text = _coerce_string(payload.get("summary_text"))
+        if summary_text is None and isinstance(summary_field, str):
+            summary_text = summary_field.strip()
 
-    def _extract_features(self, text: str) -> List[str]:
-        tokens = self._tokenize(text)
-        feats: List[str] = []
-        feats.extend(f"token::{tok}" for tok in tokens)
-        feats.extend(f"bigram::{a}_{b}" for a, b in zip(tokens, tokens[1:]))
-        if "?" in text:
-            feats.append("punct::question")
-        if "!" in text:
-            feats.append("punct::exclaim")
-        if re.search(r"[\U0001F300-\U0001FAFF]", text):
-            feats.append("has_emoji")
-        return feats
+        topics_meta: List[Mapping[str, Any]] = []
+        topics: List[str] = []
+        for item in payload.get("topics") or []:
+            if isinstance(item, Mapping):
+                label = _coerce_string(item.get("label") or item.get("topic"))
+                if label:
+                    topics.append(label)
+                topics_meta.append({str(k): v for k, v in item.items()})
+            elif isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    topics.append(cleaned)
 
-    # ---- Learning -----------------------------------------------------------
-    def _apply_decay(self) -> None:
-        now = _now()
-        elapsed = max(0.0, now - self._last_decay_ts)
-        if elapsed < 1.0:
-            return
-        factor = self.decay ** (elapsed / 30.0)
-        if factor >= 0.9995:
-            return
-        for feat in list(self.feature_weights.keys()):
-            self.feature_weights[feat] *= factor
-            if abs(self.feature_weights[feat]) < 1e-6:
-                self.feature_weights.pop(feat, None)
-        for token in list(self.token_memory.keys()):
-            self.token_memory[token] = int(self.token_memory[token] * factor)
-            if self.token_memory[token] <= 0:
-                self.token_memory.pop(token, None)
-        self.bias *= factor
-        self._last_decay_ts = now
+        key_moments = _coerce_string_list(payload.get("key_moments"))
+        follow_ups = _coerce_string_list(payload.get("follow_up_questions"))
+        alerts = _coerce_string_list(payload.get("alerts"))
+        notes = _coerce_string_list(payload.get("notes"))
+        tone = _coerce_string(payload.get("tone"))
+        user_style = _coerce_mapping(payload.get("user_style"))
+        meta = _coerce_mapping(payload.get("meta"))
+        recommended_actions = _coerce_action_list(payload.get("recommended_actions"))
 
-    def observe(self, text: str, positive_tokens: Sequence[str]) -> None:
-        self._apply_decay()
-        feats = self._extract_features(text)
-        label = 1.0 if positive_tokens else 0.0
-        score = self.score(text)
-        error = label - score
-        step = self.learning_rate * error
-        if abs(step) < 1e-5:
-            step = 0.0
-        if step:
-            for feat in feats:
-                self.feature_weights[feat] += step
-            self.bias += step
-        for token in positive_tokens:
-            norm = token.lower().strip()
-            if norm:
-                self.token_memory[norm] += 1
+        raw: MutableMapping[str, Any] = dict(payload)
+        return cls(
+            last_message=last_message,
+            recent_messages=recent_messages,
+            summary_bullets=summary_bullets,
+            summary_text=summary_text,
+            topics=topics,
+            topics_meta=topics_meta,
+            key_moments=key_moments,
+            user_style=user_style,
+            follow_up_questions=follow_ups,
+            recommended_actions=recommended_actions,
+            alerts=alerts,
+            tone=tone,
+            notes=notes,
+            meta=meta,
+            raw=raw,
+        )
 
-    # ---- Inference ----------------------------------------------------------
-    def score(self, text: str) -> float:
-        feats = self._extract_features(text)
-        activation = self.bias
-        for feat in feats:
-            activation += self.feature_weights.get(feat, 0.0)
-        try:
-            return 1.0 / (1.0 + math.exp(-activation))
-        except OverflowError:
-            return 0.0 if activation < 0 else 1.0
-
-    def fallback_topics(
-        self,
-        text: str,
-        exclude: Sequence[str],
-        top_k: int = 3,
-        min_score: float = 0.5,
-    ) -> List[str]:
-        exclude_set = {e.lower() for e in exclude}
-        feats = self._extract_features(text)
-        scored: List[Tuple[float, str]] = []
-        for feat in feats:
-            if not feat.startswith("token::"):
-                continue
-            token = feat.split("::", 1)[1]
-            if token in exclude_set:
-                continue
-            weight = self.feature_weights.get(feat, 0.0) + 0.15 * self.token_memory.get(token, 0)
-            if weight <= 0:
-                continue
-            scored.append((weight, token))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        results = []
-        for weight, token in scored:
-            if len(results) >= top_k:
-                break
-            # logistic style check for the token context
-            if self.score(token) < min_score:
-                continue
-            results.append(token)
-        return results
-
-    def diagnostics(self) -> Dict[str, Any]:
-        top_tokens = Counter({k.split("::", 1)[1]: v for k, v in self.feature_weights.items() if k.startswith("token::")})
-        return {
-            "bias": round(self.bias, 5),
-            "known_tokens": len(self.token_memory),
-            "top_features": [tok for tok, _ in top_tokens.most_common(5)],
+    def to_dict(self) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "last_message": self.last_message,
+            "recent_messages": [msg.to_payload() for msg in self.recent_messages],
+            "summary": list(self.summary_bullets),
+            "summary_text": self.summary_text,
+            "topics": list(self.topics),
+            "key_moments": list(self.key_moments),
+            "user_style": dict(self.user_style),
+            "follow_up_questions": list(self.follow_up_questions),
+            "recommended_actions": [dict(action) for action in self.recommended_actions],
+            "alerts": list(self.alerts),
+            "tone": self.tone,
+            "notes": list(self.notes),
+            "meta": dict(self.meta),
+            "llm_summary": dict(self.raw),
         }
+        if self.topics_meta:
+            data["llm_topics"] = [dict(item) for item in self.topics_meta]
+        return data
 
 
 class ContextBuilder:
-    """Build a conversational snapshot from the memory buffers.
+    """Conversation context orchestrator relying exclusively on the LLM."""
 
-    The conversation module uses this builder to feed UI/prompts with
-    recent exchanges, salient milestones and lightweight user style
-    heuristics.  It deliberately focuses on human-facing summaries and is
-    distinct from the rule-engine context builder located in
-    :mod:`AGI_Evolutive.social.interaction_rule`, which prepares symbolic
-    predicates for social tactics selection.
-    """
-
-    TTL_OPTIONS_DAYS: Tuple[int, ...] = (3, 7, 14, 30)
-    _TTL_STEP_MAX: int = 1
-
-    def __init__(self, arch):
+    def __init__(
+        self,
+        arch,
+        *,
+        llm_spec: str = "conversation_context",
+        recent_limit: int = 12,
+        llm_manager=None,
+    ) -> None:
         self.arch = arch
-        self.mem = arch.memory
-        self._ttl_cache: Dict[str, _TTLCacheEntry] = {}
-        self._hazard_history: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=64))
-        self._drift_log: Deque[Tuple[float, str, int, int]] = deque(maxlen=50)
-        self._topic_classifier = OnlineTopicClassifier()
-        self._feedback_history: Deque[Dict[str, Any]] = deque(maxlen=128)
-        self._sequence_buffer: Deque[str] = deque(maxlen=128)
-        self._persona_overrides: Dict[str, Dict[str, float]] = {}
+        self._llm_spec = llm_spec
+        self._recent_limit = max(1, int(recent_limit))
+        self._llm_manager = llm_manager or get_llm_manager()
+        self._last_result: Optional[LLMConversationContext] = None
 
-    # ------------------------------------------------------------------ TTL --
-    def _ttl_seconds_for(self, kind: str, timestamps: Sequence[float]) -> float:
-        kind = (kind or "unknown").lower()
-        ttl_entry = self._ttl_cache.get(kind)
-        now = _now()
+    @property
+    def last_result(self) -> Optional[LLMConversationContext]:
+        return self._last_result
 
-        def select_index_from_half_life(half_life_days: float) -> int:
-            closest_idx = min(
-                range(len(self.TTL_OPTIONS_DAYS)),
-                key=lambda idx: abs(self.TTL_OPTIONS_DAYS[idx] - half_life_days),
-            )
-            if ttl_entry is None:
-                return closest_idx
-            prev_idx = ttl_entry.ttl_index
-            if closest_idx == prev_idx:
-                return prev_idx
-            # bound the update speed (step max)
-            direction = 1 if closest_idx > prev_idx else -1
-            step = max(-self._TTL_STEP_MAX, min(self._TTL_STEP_MAX, direction))
-            bounded_idx = prev_idx + step
-            if bounded_idx != prev_idx:
-                self._drift_log.append((now, kind, prev_idx, bounded_idx))
-            return bounded_idx
+    def _memory_source(self):
+        return getattr(self.arch, "memory", None)
 
-        if timestamps:
-            sorted_ts = sorted(set(_safe_float(ts, now) for ts in timestamps if ts))
-            if len(sorted_ts) > 1:
-                intervals = [b - a for a, b in zip(sorted_ts, sorted_ts[1:]) if b >= a]
-                if intervals:
-                    mean_interval = sum(intervals) / len(intervals)
-                    hazard = 1.0 / max(mean_interval, 60.0)
-                    half_life_sec = math.log(2.0) / hazard
-                    half_life_days = max(1.0, min(45.0, half_life_sec / 86400.0))
-                    idx = select_index_from_half_life(half_life_days)
-                    ttl_days = self.TTL_OPTIONS_DAYS[idx]
-                    ttl_seconds = float(ttl_days * 86400)
-                    self._ttl_cache[kind] = _TTLCacheEntry(idx, ttl_seconds, now)
-                    return ttl_seconds
-        if ttl_entry is not None:
-            return ttl_entry.ttl_seconds
-        # default selection leaning on frequency (no timestamps or single point)
-        default_idx = select_index_from_half_life(7.0)
-        ttl_seconds = float(self.TTL_OPTIONS_DAYS[default_idx] * 86400)
-        self._ttl_cache[kind] = _TTLCacheEntry(default_idx, ttl_seconds, now)
-        return ttl_seconds
-
-    def _group_timestamps_by_kind(
-        self, memories: Sequence[Mapping[str, Any]]
-    ) -> Dict[str, List[float]]:
-        grouped: Dict[str, List[float]] = defaultdict(list)
-        for memory in memories:
-            kind = (memory.get("memory_type") or memory.get("kind") or "unknown").lower()
-            ts = memory.get("ts") or memory.get("timestamp") or memory.get("t")
-            grouped[kind].append(_safe_float(ts, _now()))
-        return grouped
-
-    # -------------------------------------------------------------- Persona --
-    def _infer_user_id(self) -> str:
-        user_model = getattr(self.arch, "user_model", None)
-        if user_model is None:
-            return "anonymous"
+    def _recent_messages(self) -> List[ConversationMessage]:
+        source = self._memory_source()
+        if source is None:
+            return []
         try:
-            desc = user_model.describe()
-        except Exception:
-            desc = {}
-        for key in ("id", "user_id", "uuid"):
-            value = desc.get(key)
-            if value:
-                return str(value)
-        return "anonymous"
-
-    def _persona_settings(self, user_id: str) -> Dict[str, float]:
-        if user_id in self._persona_overrides:
-            return self._persona_overrides[user_id]
-        persona: Dict[str, Any] = {}
-        user_model = getattr(self.arch, "user_model", None)
-        if user_model is not None:
-            try:
-                persona = (user_model.describe() or {}).get("persona", {}) or {}
-            except Exception:
-                persona = {}
-        tone = (persona.get("tone") or "").lower()
-        overrides = {
-            "long_threshold": 160.0,
-            "question_ratio": 0.2,
-            "exclaim_ratio": 0.1,
-        }
-        if "verbose" in tone or "déta" in tone:
-            overrides["long_threshold"] = 120.0
-        if "introvert" in tone:
-            overrides["question_ratio"] = 0.12
-        values = persona.get("values") or {}
-        if isinstance(values, Mapping) and values.get("curiosity", 0) > 0.6:
-            overrides["question_ratio"] = 0.15
-        self._persona_overrides[user_id] = overrides
-        return overrides
-
-    # ------------------------------------------------------------- Feedback --
-    def _pull_feedback(self) -> Iterable[Dict[str, Any]]:
-        sources = []
-        for attr in ("conversation_feedback", "feedback_bus", "telemetry"):
-            payload = getattr(self.arch, attr, None)
-            if payload is None:
-                continue
-            if hasattr(payload, "pop"):
-                try:
-                    item = payload.pop("conversation", None)
-                    if item:
-                        sources.append(item)
-                except Exception:
-                    continue
-            elif callable(getattr(payload, "get", None)):
-                try:
-                    entries = payload.get("conversation_feedback")
-                except Exception:
-                    entries = None
-                if entries:
-                    sources.extend(entries)
-        return sources
-
-    def _update_feedback_loop(self, ctx: Dict[str, Any]) -> None:
-        for feedback in self._pull_feedback():
-            try:
-                payload = {
-                    "ts": _safe_float(feedback.get("ts"), _now()),
-                    "kind": feedback.get("kind") or "unknown",
-                    "delta_topics": feedback.get("delta_topics"),
-                }
-                self._feedback_history.append(payload)
-            except Exception:
-                continue
-        if ctx.get("topics"):
-            self._sequence_buffer.extend(ctx["topics"])
-
-    # -------------------------------------------------------- Seq. motifs ---
-    def _sequence_motifs(self, recents: Sequence[Mapping[str, Any]]) -> List[str]:
-        sequences: Counter[Tuple[str, str]] = Counter()
-        normalized_msgs: List[List[str]] = []
-        for memo in recents:
-            txt = _normalize_text(memo.get("text") or memo.get("content") or "")
-            if not txt:
-                continue
-            tokens = [t for t in re.findall(r"[\w'’]{3,}", txt.lower()) if len(t) >= 3]
-            if tokens:
-                normalized_msgs.append(tokens)
-        for tokens in normalized_msgs:
-            for pair in zip(tokens, tokens[1:]):
-                sequences[pair] += 1
-        motifs: List[str] = []
-        for (a, b), count in sequences.most_common(5):
-            if count < 2:
-                continue
-            motifs.append(f"{a} → {b} (x{count})")
-        return motifs
-
-    # --------------------------------------------------------- Recent msgs --
-    def _fetch_recent_memories(self, limit: int) -> List[Dict[str, Any]]:
-        try:
-            return list(self.mem.get_recent_memories(n=limit))
+            records = source.get_recent_memories(n=self._recent_limit)
         except TypeError:
-            # legacy signature using limit
-            return list(self.mem.get_recent_memories(limit=limit))
+            records = source.get_recent_memories(limit=self._recent_limit)
         except Exception:
             return []
+        messages: List[ConversationMessage] = []
+        for memo in records:
+            if isinstance(memo, Mapping):
+                message = ConversationMessage.from_memory(memo)
+                if message.text:
+                    messages.append(message)
+        return messages[-self._recent_limit :]
 
-    def _recent_msgs(self, k: int = 8) -> List[Dict[str, Any]]:
-        rec = self._fetch_recent_memories(240)
-        grouped = self._group_timestamps_by_kind(rec)
-        ttl_per_kind = {kind: self._ttl_seconds_for(kind, ts_list) for kind, ts_list in grouped.items()}
-        now = _now()
-        chats: List[Dict[str, Any]] = []
-        for memory in rec:
-            kind = (memory.get("kind") or memory.get("memory_type") or "").lower()
-            if kind not in {"interaction", "chat", "message"}:
-                continue
-            ttl_seconds = ttl_per_kind.get(kind, ttl_per_kind.get("interaction", 7 * 86400.0))
-            ts = _safe_float(
-                memory.get("ts") or memory.get("timestamp") or memory.get("t"),
-                now,
-            )
-            if now - ts > ttl_seconds:
-                continue
-            chats.append(memory)
-        return chats[-k:]
+    def _lessons(self) -> List[str]:
+        consolidator = getattr(self.arch, "consolidator", None)
+        if not consolidator:
+            return []
+        state = getattr(consolidator, "state", {})
+        lessons = state.get("lessons") if isinstance(state, Mapping) else None
+        return _coerce_string_list(lessons)
 
-    # ------------------------------------------------------------ Moments ---
-    def _key_moments(self, horizon: int = 2000) -> List[str]:
-        rec = self._fetch_recent_memories(horizon)
-        grouped = self._group_timestamps_by_kind(rec)
-        ttl_per_kind = {kind: self._ttl_seconds_for(kind, ts_list) for kind, ts_list in grouped.items()}
-        now = _now()
-        marks: List[str] = []
-        watch_tags = {"milestone", "decision", "preference", "pinned"}
-        for memory in rec:
-            if not watch_tags.intersection(set(memory.get("tags") or [])):
-                continue
-            kind = (memory.get("memory_type") or memory.get("kind") or "milestone").lower()
-            ttl_seconds = ttl_per_kind.get(kind, 14 * 86400.0)
-            ts = _safe_float(memory.get("ts") or memory.get("timestamp"), now)
-            if now - ts > ttl_seconds:
-                continue
-            txt = (memory.get("text") or memory.get("content") or "")
-            marks.append(f"- {_fmt_date(ts)} : {txt[:80]}")
-        return marks[-8:]
-
-    # -------------------------------------------------------------- Topics ---
-    _STOPWORDS = {
-        "bonjour",
-        "merci",
-        "avec",
-        "alors",
-        "aussi",
-        "cela",
-        "comme",
-        "avoir",
-        "faire",
-        "cette",
-        "c'est",
-    }
-
-    _STRUCTURE_PATTERNS = (
-        re.compile(r"\best\s+(?:un|une|le|la|l['’])\s+([\wà-ÿ]{3,})", re.IGNORECASE),
-        re.compile(r"\bc['’]est\s+(?:quoi\s+)?([\wà-ÿ]{3,})", re.IGNORECASE),
-    )
-
-    def _topics(self, recents: List[Dict[str, Any]]) -> List[str]:
-        c = Counter()
-        candidate_tokens: List[str] = []
-        for memo in recents:
-            txt_raw = memo.get("text") or memo.get("content") or ""
-            txt = _normalize_text(txt_raw)
-            if not txt:
-                continue
-            lowered = txt.lower()
-            tokens = re.findall(r"[a-zà-ÿ]{3,}", lowered)
-            for pattern in self._STRUCTURE_PATTERNS:
-                for match in pattern.findall(txt):
-                    cleaned = match.lower()
-                    if cleaned:
-                        c[cleaned] += 1.5
-            for w in tokens:
-                if w in self._STOPWORDS:
-                    continue
-                c[w] += 1
-            candidate_tokens.extend(tokens)
-            if not tokens:
-                self._topic_classifier.observe(txt, [])
-            else:
-                top = [tok for tok in tokens if tok not in self._STOPWORDS][:3]
-                self._topic_classifier.observe(txt, top)
-        top_topics = [w for w, _ in c.most_common(10)]
-        if len(top_topics) < 5 and candidate_tokens:
-            fallback = []
-            for memo in recents:
-                txt = memo.get("text") or memo.get("content") or ""
-                fallback.extend(self._topic_classifier.fallback_topics(txt, top_topics, top_k=5))
-            for token in fallback:
-                if token not in top_topics:
-                    top_topics.append(token)
-                if len(top_topics) >= 10:
-                    break
-        return top_topics[:10]
-
-    # ------------------------------------------------------------ User style --
-    def _user_style(self, recents: List[Dict[str, Any]], persona_overrides: Dict[str, float]) -> Dict[str, Any]:
-        long_threshold = persona_overrides.get("long_threshold", 160.0)
-        question_ratio = persona_overrides.get("question_ratio", 0.2)
-        exclaim_ratio = persona_overrides.get("exclaim_ratio", 0.1)
-        count = len(recents) or 1
-        long_msgs = sum(1 for m in recents if len(_normalize_text(m.get("text") or "")) > long_threshold)
-        questions = sum(1 for m in recents if "?" in (m.get("text") or ""))
-        exclam = sum(1 for m in recents if "!" in (m.get("text") or ""))
-        expressive_score = exclam / count
-        return {
-            "prefers_long": (long_msgs / count) > 0.3,
-            "asks_questions": (questions / count) > question_ratio,
-            "expressive": expressive_score > exclaim_ratio,
-            "expressive_score": round(expressive_score, 3),
-        }
-
-    # ----------------------------------------------------------- Related doc --
-    def _related_inbox(self, user_msg: str) -> List[str]:
-        # si tu as un index de docs, branche-le ici ; sinon laisse vide
-        related_provider = getattr(self.arch, "related_index", None)
-        if related_provider and hasattr(related_provider, "search"):
+    def _persona(self) -> Mapping[str, Any]:
+        user_model = getattr(self.arch, "user_model", None)
+        if user_model and hasattr(user_model, "describe"):
             try:
-                results = related_provider.search(user_msg, top_k=3)
-                return [str(item) for item in results]
+                desc = user_model.describe() or {}
             except Exception:
-                logger.debug("related_inbox search failed", exc_info=True)
-        return []
+                desc = {}
+            if isinstance(desc, Mapping):
+                return desc
+        return {}
 
-    # ------------------------------------------------------------- Monitoring --
-    def _monitoring_snapshot(self) -> Dict[str, Any]:
-        ttl_snapshot = {
-            kind: {
-                "days": self.TTL_OPTIONS_DAYS[entry.ttl_index],
-                "seconds": entry.ttl_seconds,
-                "updated_at": entry.updated_at,
-            }
-            for kind, entry in self._ttl_cache.items()
-        }
-        recent_drifts = list(self._drift_log)[-10:]
-        drift_entries = [
-            {
-                "ts": ts,
-                "kind": kind,
-                "from": self.TTL_OPTIONS_DAYS[old_idx],
-                "to": self.TTL_OPTIONS_DAYS[new_idx],
-            }
-            for ts, kind, old_idx, new_idx in recent_drifts
-        ]
-        return {
-            "ttl": ttl_snapshot,
-            "drift_log": drift_entries,
-            "classifier": self._topic_classifier.diagnostics(),
-            "feedback_buffer": list(self._feedback_history)[-5:],
-        }
-
-    def _llm_enrichment(
+    def build(
         self,
-        user_msg: str,
-        recent: List[Dict[str, Any]],
-        long_summary: List[Any],
-        topics: List[str],
-        persona_overrides: Mapping[str, float],
-    ) -> Optional[Mapping[str, Any]]:
-        if not _llm_enabled():
-            return None
+        user_message: str,
+        *,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        last_message = _normalize_text(user_message)
+        recent = self._recent_messages()
+        persona = self._persona()
+        lessons = self._lessons()
 
-        recent_payload: List[Dict[str, Any]] = []
-        for memo in recent[-6:]:
-            text = memo.get("text") or memo.get("content") or ""
-            recent_payload.append(
-                {
-                    "speaker": memo.get("speaker") or memo.get("role"),
-                    "text": _normalize_text(text)[:500],
-                    "ts": memo.get("ts") or memo.get("t"),
-                }
-            )
-
-        payload = {
-            "last_message": user_msg,
-            "recent_messages": recent_payload,
-            "topics": topics,
-            "lessons": long_summary,
-            "user_style": self._user_style(recent, persona_overrides),
+        payload: Dict[str, Any] = {
+            "last_message": last_message,
+            "recent_messages": [msg.to_payload() for msg in recent],
         }
+        if persona:
+            payload["persona"] = dict(persona)
+        if lessons:
+            payload["lessons"] = list(lessons)
+        if extra:
+            payload["extra"] = _coerce_mapping(extra)
 
         try:
-            response = _llm_manager().call_dict(
-                "conversation_context",
+            response = self._llm_manager.call_dict(
+                self._llm_spec,
                 input_payload=payload,
             )
-        except (LLMUnavailableError, LLMIntegrationError):
-            logger.debug("LLM conversation context unavailable", exc_info=True)
-            return None
+        except LLMIntegrationError as exc:  # pragma: no cover - integration failure propagated
+            raise ConversationContextError(str(exc)) from exc
 
-        if not isinstance(response, Mapping):
-            return None
+        result = LLMConversationContext.from_payload(
+            response,
+            last_message=last_message,
+            recent_messages=recent,
+        )
+        self._last_result = result
+        return result.to_dict()
 
-        return dict(response)
 
-    # ---------------------------------------------------------------- Build ---
-    def build(self, user_msg: str) -> Dict[str, Any]:
-        user_id = self._infer_user_id()
-        persona_overrides = self._persona_settings(user_id)
-        recent = self._recent_msgs(8)
-        long_summary: List[Any]
-        try:
-            long_summary = (self.arch.consolidator.state.get("lessons", []) or [])[-5:]
-        except Exception:
-            long_summary = []
-        topics = self._topics(recent)
-        ctx = {
-            "last_message": user_msg,
-            "active_thread": recent,
-            "summary": long_summary,              # bullets
-            "key_moments": self._key_moments(),   # avec dates
-            "topics": topics,
-            "user_style": self._user_style(recent, persona_overrides),
-            "related_inbox": self._related_inbox(user_msg),
-            "sequence_motifs": self._sequence_motifs(recent),
-            "persona_overrides": persona_overrides,
-        }
-        self._update_feedback_loop(ctx)
-        ctx["monitoring"] = self._monitoring_snapshot()
-
-        llm_bundle = self._llm_enrichment(user_msg, recent, long_summary, topics, persona_overrides)
-        if llm_bundle:
-            ctx.setdefault("llm_summary", llm_bundle)
-            summary_text = llm_bundle.get("summary")
-            if isinstance(summary_text, str) and summary_text:
-                ctx.setdefault("llm_summary_text", summary_text)
-            llm_topics = llm_bundle.get("topics")
-            if isinstance(llm_topics, list) and llm_topics:
-                ctx.setdefault("llm_topics", llm_topics)
-            tone = llm_bundle.get("tone")
-            if isinstance(tone, str) and tone:
-                ctx.setdefault("tone", tone)
-            alerts = llm_bundle.get("alerts")
-            if isinstance(alerts, list) and alerts:
-                ctx.setdefault("alerts", alerts)
-
-        return ctx
+__all__ = [
+    "ConversationContextError",
+    "ConversationMessage",
+    "ContextBuilder",
+    "LLMConversationContext",
+]

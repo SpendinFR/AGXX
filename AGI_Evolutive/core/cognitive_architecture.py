@@ -551,9 +551,7 @@ class CognitiveArchitecture:
             return None
         try:
             context = self.rag_adaptive.prepare_query(question)
-            cfg = context.get("config")
-            if isinstance(cfg, dict):
-                self._apply_rag_config(cfg)
+            self._apply_rag_config(self.rag_adaptive.current_config())
             self._rag_last_context = context
             return context
         except Exception as exc:
@@ -1348,13 +1346,32 @@ class CognitiveArchitecture:
         nlg_state = self._language_state_snapshot()
         predicate_registry = self._predicate_registry_for_state(nlg_state)
         nlg_context = NLGContext(base_text, self._resolve_nlg_hint_applier())
+        metadata = {
+            "surface": surface,
+            "style": {"user_id": self.last_user_id},
+            "reasoning_summary": reason_out.get("summary"),
+        }
         try:
-            apply_mai_bids_to_nlg(nlg_context, nlg_state, predicate_registry)
+            nlg_result = apply_mai_bids_to_nlg(
+                nlg_context,
+                nlg_state,
+                predicate_registry,
+                contract=contract,
+                reasoning=reason_out,
+                metadata=metadata,
+            )
         except Exception:
-            pass
+            nlg_result = None
         applied_hints = nlg_context.applied_hints()
         if applied_hints:
             reason_out["applied_hints"] = applied_hints
+        if nlg_result is not None:
+            if nlg_result.safety_notes:
+                reason_out["nlg_safety_notes"] = list(nlg_result.safety_notes)
+            if nlg_result.tone:
+                reason_out["nlg_tone"] = nlg_result.tone
+            if nlg_result.meta:
+                reason_out["nlg_meta"] = dict(nlg_result.meta)
         base_reply = nlg_context.text.strip() or ""
         if not base_reply:
             base_reply = reason_out.get("summary") or surface.strip()

@@ -4,10 +4,14 @@ import json
 import logging
 import os
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from AGI_Evolutive.utils.jsonsafe import json_sanitize
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import (
+    LLMIntegrationError,
+    LLMUnavailableError,
+    get_llm_manager,
+)
 
 from .metrics import aggregate_metrics, bootstrap_superiority, dominates
 from .mutations import generate_overrides
@@ -86,35 +90,39 @@ class SelfImprover:
         metadata: Optional[Dict[str, Any]] = None,
     ) -> tuple[bool, Dict[str, Any], Optional[Dict[str, Any]]]:
         metadata = dict(metadata or {})
-        response = try_call_llm_dict(
-            "self_improver_promotion_brief",
-            input_payload={
-                "overrides": overrides,
-                "metrics": metrics,
-                "metadata": metadata,
-            },
-            logger=_LOGGER,
-            max_retries=2,
-        )
-        response_data = dict(response) if response else None
-        if response_data:
-            metadata.setdefault("llm_brief", response_data)
-            go_value = response_data.get("go")
-            confidence = response_data.get("confidence", 0.0)
-            try:
-                conf_val = float(confidence)
-            except (TypeError, ValueError):
-                conf_val = 0.0
-            if isinstance(go_value, bool) and not go_value and conf_val >= 0.75:
-                self._log_experiment(
-                    {
-                        "kind": "llm_gate_reject",
-                        "overrides": overrides,
-                        "metrics": metrics,
-                        "llm_brief": response_data,
-                    }
-                )
-                return True, metadata, response_data
+        try:
+            response = get_llm_manager().call_dict(
+                "self_improver_promotion_brief",
+                input_payload={
+                    "overrides": overrides,
+                    "metrics": metrics,
+                    "metadata": metadata,
+                },
+                max_retries=2,
+            )
+        except (LLMUnavailableError, LLMIntegrationError) as exc:
+            raise RuntimeError(
+                f"self_improver_promotion_brief LLM call failed: {exc}"
+            ) from exc
+
+        response_data = dict(response)
+        metadata.setdefault("llm_brief", response_data)
+        go_value = response_data.get("go")
+        confidence = response_data.get("confidence", 0.0)
+        try:
+            conf_val = float(confidence)
+        except (TypeError, ValueError):
+            conf_val = 0.0
+        if isinstance(go_value, bool) and not go_value and conf_val >= 0.75:
+            self._log_experiment(
+                {
+                    "kind": "llm_gate_reject",
+                    "overrides": overrides,
+                    "metrics": metrics,
+                    "llm_brief": response_data,
+                }
+            )
+            return True, metadata, response_data
         return False, metadata, response_data
 
     # ------------------------------------------------------------------
@@ -147,17 +155,20 @@ class SelfImprover:
         if not self.code_evolver:
             return None
         base = self._active_overrides()
-        champion_eval = self.sandbox.run_all(base)
-        champion_metrics = aggregate_metrics(champion_eval.get("samples", []))
         best_cid: Optional[str] = None
-        for patch in self.code_evolver.generate_candidates(max(1, n_candidates)):
+        patches = self.code_evolver.generate_candidates(max(1, n_candidates))
+        for patch in patches:
             serialised = self.code_evolver.serialise_patch(patch)
-            report = self.code_evolver.evaluate_patch(patch, champion_metrics)
+            report = self.code_evolver.evaluate_patch(patch, None)
+            aggregated = report.get("expected_metrics", {})
+            if not isinstance(aggregated, dict):
+                aggregated = dict(aggregated) if isinstance(aggregated, Mapping) else {}
             payload = {
                 "kind": "code_cycle",
                 "summary": report.get("summary"),
                 "passed": report.get("passed", False),
                 "file": report.get("file"),
+                "confidence": report.get("confidence"),
             }
             self._log_experiment(payload)
             if not report.get("passed", False):
@@ -166,21 +177,26 @@ class SelfImprover:
                         self.memory.add_memory(
                             kind="code_tests_failed",
                             content=str(report.get("summary", ""))[:160],
-                            metadata={"lint": report.get("lint"), "static": report.get("static")},
+                            metadata={
+                                "assessment": report.get("assessment"),
+                                "notes": report.get("notes"),
+                                "confidence": report.get("confidence"),
+                                "patch": serialised,
+                            },
                         )
                 except Exception:
                     pass
                 continue
-            evaluation = report.get("evaluation", {})
-            aggregated = aggregate_metrics(evaluation.get("samples", []))
             metadata = {
                 "kind": "code_patch",
                 "file": report.get("file"),
                 "diff": report.get("diff"),
                 "summary": report.get("summary"),
+                "assessment": report.get("assessment"),
                 "quality": report.get("quality"),
                 "canary": report.get("canary"),
                 "patch": serialised,
+                "llm_payload": report.get("llm_payload"),
             }
             skip_candidate, metadata, llm_brief = self._llm_guard_candidate(base, aggregated, metadata)
             if skip_candidate:
@@ -189,15 +205,16 @@ class SelfImprover:
             best_cid = cid
             try:
                 if hasattr(self.memory, "add_memory"):
+                    summary_text = str((metadata.get("llm_brief") or {}).get("summary") or report.get("summary", ""))[:160]
                     self.memory.add_memory(
                         kind="code_candidate",
-                        content=str((metadata.get("llm_brief") or {}).get("summary") or report.get("summary", ""))[:160],
-                        metadata={"candidate_id": cid, "file": report.get("file")},
+                        content=summary_text,
+                        metadata={"candidate_id": cid, "file": report.get("file"), "assessment": report.get("assessment")},
                     )
                     self.memory.add_memory(
                         kind="code_tests_passed",
                         content=str(report.get("summary", ""))[:160],
-                        metadata={"candidate_id": cid, "evaluation": aggregated},
+                        metadata={"candidate_id": cid, "evaluation": aggregated, "confidence": report.get("confidence")},
                     )
             except Exception:
                 pass

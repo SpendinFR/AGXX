@@ -24,7 +24,7 @@ def test_interpreter_batches_and_writes(tmp_path):
     manager = StubManager(payload)
     log_path = tmp_path / "llm_analytics.jsonl"
     interpreter = LLMAnalyticsInterpreter(
-        manager=manager,
+        llm_manager=manager,
         enabled=True,
         batch_size=2,
         flush_interval=999.0,

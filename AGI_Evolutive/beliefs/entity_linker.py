@@ -1,359 +1,252 @@
-"""Simple entity linker handling aliases and synonym resolution for the belief graph."""
+"""LLM-backed entity resolution for the belief graph."""
+
 from __future__ import annotations
 
-import logging
-import math
-import time
-from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Any, Iterable, Mapping, MutableMapping, Optional
 
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
-
-
-LOGGER = logging.getLogger(__name__)
+from AGI_Evolutive.utils.llm_service import LLMIntegrationError, get_llm_manager
 
 
-def _sigmoid(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x))
+def _ensure_mapping(value: Any) -> MutableMapping[str, Any]:
+    if isinstance(value, Mapping):
+        return {str(k): v for k, v in value.items()}
+    return {}
 
 
-def _logit(p: float) -> float:
-    p = min(max(p, 1e-6), 1 - 1e-6)
-    return math.log(p / (1 - p))
+def _ensure_str_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return [cleaned] if cleaned else []
+    if isinstance(value, Iterable):
+        result: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    result.append(cleaned)
+        return result
+    return []
+
+
+def _coerce_float(value: Any, *, default: float = 0.5) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    if number != number:  # NaN
+        number = default
+    return number
 
 
 @dataclass
-class EntityRecord:
+class EntityEntry:
+    """Snapshot of a canonical entity returned by the LLM."""
+
     canonical_id: str
     name: str
     entity_type: str
-    popularity: float = 0.5
-    activation: float = 0.0
-    last_update: float = field(default_factory=time.monotonic)
-    context_weights: Dict[str, float] = field(default_factory=dict)
+    confidence: float = 0.5
+    justification: Optional[str] = None
+    aliases: set[str] = field(default_factory=set)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    raw: Mapping[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        if self.activation == 0.0:
-            self.activation = _logit(self.popularity)
-        else:
-            self.popularity = _sigmoid(self.activation)
-
-    def apply_decay(self, decay_rate: float, now: Optional[float] = None) -> None:
-        if decay_rate <= 0.0:
-            return
-        now = now or time.monotonic()
-        elapsed = max(0.0, now - self.last_update)
-        if elapsed == 0.0:
-            return
-        factor = math.exp(-decay_rate * elapsed)
-        self.activation *= factor
-        for key in list(self.context_weights):
-            self.context_weights[key] *= factor
-        self.popularity = _sigmoid(self.activation)
-        self.last_update = now
-
-    def bump(
-        self,
-        weight: float,
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
         *,
-        decay_rate: float = 0.0,
-        context: Optional[str] = None,
-        now: Optional[float] = None,
-    ) -> None:
-        now = now or time.monotonic()
-        if decay_rate:
-            self.apply_decay(decay_rate, now)
-        self.activation += weight
-        self.popularity = _sigmoid(self.activation)
-        if context:
-            self.context_weights[context] = self.context_weights.get(context, 0.0) + weight
-        self.last_update = now
-
-    def contextual_popularity(self, context: Optional[str]) -> float:
-        if not context:
-            return self.popularity
-        extra = self.context_weights.get(context)
-        if extra is None:
-            return self.popularity
-        return _sigmoid(self.activation + extra)
-
-
-class AdaptiveWeighter:
-    """Simple online learner that adapts weights per entity type."""
-
-    def __init__(
-        self,
-        base_weights: Optional[Dict[str, float]] = None,
-        *,
-        learning_rate: float = 0.25,
-        adapt_gain: float = 0.6,
-        decay: float = 0.02,
-    ) -> None:
-        self._base_weights = base_weights or {"register": 0.1, "alias": 0.05, "merge": 0.05, "resolve": 0.05}
-        self._learning_rate = learning_rate
-        self._adapt_gain = adapt_gain
-        self._decay = decay
-        self._weights: Dict[Tuple[str, str], float] = {}
-        self._last_seen: Dict[Tuple[str, str], float] = {}
-
-    def _base(self, event: str) -> float:
-        return self._base_weights.get(event, 0.05)
-
-    def _apply_decay(self, key: Tuple[str, str]) -> float:
-        now = time.monotonic()
-        weight = self._weights.get(key, self._base(key[0]))
-        last = self._last_seen.get(key)
-        if last is not None and self._decay > 0.0:
-            elapsed = max(0.0, now - last)
-            if elapsed:
-                weight *= math.exp(-self._decay * elapsed)
-        self._last_seen[key] = now
-        return weight
-
-    def score(self, event: str, entity_type: Optional[str], record: Optional[EntityRecord]) -> float:
-        key = (event, entity_type or "*")
-        current = self._apply_decay(key)
-        base = self._base(event)
-        target = base
-        if record:
-            deficiency = max(0.0, 1.0 - record.popularity)
-            target += deficiency * self._adapt_gain
-        updated = (1.0 - self._learning_rate) * current + self._learning_rate * target
-        updated = max(0.01, min(updated, 1.0))
-        self._weights[key] = updated
-        return updated
+        fallback_id: str,
+        fallback_name: str,
+        fallback_type: Optional[str],
+    ) -> "EntityEntry":
+        mapping = _ensure_mapping(payload)
+        canonical = str(mapping.get("canonical_id") or fallback_id).strip() or fallback_id
+        name = str(mapping.get("name") or fallback_name).strip() or fallback_name
+        entity_type = str(mapping.get("entity_type") or fallback_type or "Entity").strip() or "Entity"
+        confidence = max(0.0, min(1.0, _coerce_float(mapping.get("confidence"), default=0.5)))
+        justification = mapping.get("justification")
+        if justification is not None:
+            justification = str(justification).strip() or None
+        metadata = _ensure_mapping(mapping.get("metadata"))
+        aliases = set(_ensure_str_list(mapping.get("aliases")))
+        if fallback_name:
+            aliases.add(fallback_name)
+        return cls(
+            canonical_id=canonical,
+            name=name,
+            entity_type=entity_type,
+            confidence=confidence,
+            justification=justification,
+            aliases=aliases,
+            metadata=metadata,
+            raw=mapping,
+        )
 
 
 class EntityLinker:
-    """
-    Maintains the low-level alias table for the belief graph.
+    """Minimal alias table that fully delegates resolution to the LLM."""
 
-    Ce composant ne dépend que des structures de croyances et sert de
-    fondation à la façade ``knowledge.EntityLinker`` qui ajoute une
-    intégration avec l'ontologie et la mémoire déclarative.
-    """
+    def __init__(self, *, llm_manager=None) -> None:
+        self._manager = llm_manager
+        self._entities: dict[str, EntityEntry] = {}
+        self._aliases: dict[str, str] = {}
 
-    def __init__(
-        self,
-        *,
-        decay_half_life: float = 600.0,
-        base_weights: Optional[Dict[str, float]] = None,
-    ) -> None:
-        self._entities: Dict[str, EntityRecord] = {}
-        self._aliases: Dict[str, str] = {}
-        self._context_usage: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
-        self._weighter = AdaptiveWeighter(base_weights)
-        self._decay_rate = math.log(2) / decay_half_life if decay_half_life > 0 else 0.0
+    def _manager_or_default(self):
+        manager = self._manager
+        if manager is None:
+            manager = get_llm_manager()
+        return manager
 
-    def _normalize(self, text: str) -> str:
-        return text.strip().lower()
+    def _normalize(self, value: str) -> str:
+        return value.strip().lower()
 
-    def _bump_context(self, canonical_id: str, context: Optional[str], weight: float) -> None:
-        if not context:
-            return
-        self._context_usage[context][canonical_id] += weight
+    def _snapshot(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for entry in list(self._entities.values())[:limit]:
+            entries.append(
+                {
+                    "canonical_id": entry.canonical_id,
+                    "name": entry.name,
+                    "entity_type": entry.entity_type,
+                    "aliases": sorted(entry.aliases),
+                    "confidence": entry.confidence,
+                }
+            )
+        return entries
+
+    def _call_llm(self, action: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        request = {
+            "action": action,
+            "payload": _ensure_mapping(payload),
+            "known_entities": self._snapshot(),
+        }
+        manager = self._manager_or_default()
+        response = manager.call_dict(
+            "entity_linker",
+            input_payload=request,
+        )
+        if not isinstance(response, Mapping):  # pragma: no cover - defensive guard
+            raise LLMIntegrationError(
+                "Spec 'entity_linker' did not return a mapping payload",
+            )
+        return response
+
+    def _store_entry(self, entry: EntityEntry, *, aliases: Iterable[str] = ()) -> EntityEntry:
+        self._entities[entry.canonical_id] = entry
+        for alias in set(entry.aliases).union(set(_ensure_str_list(aliases))):
+            norm = self._normalize(alias)
+            if norm:
+                self._aliases[norm] = entry.canonical_id
+        norm_name = self._normalize(entry.name)
+        if norm_name:
+            self._aliases[norm_name] = entry.canonical_id
+        return entry
 
     # ------------------------------------------------------------------
-    def register(
+    def resolve_entry(
         self,
         name: str,
-        entity_type: str,
         *,
-        canonical_id: Optional[str] = None,
-        weight: Optional[float] = None,
-        context: Optional[str] = None,
-    ) -> str:
-        """Registers an entity and returns its canonical identifier."""
+        entity_type: Optional[str] = None,
+        context: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> EntityEntry:
+        context_payload = _ensure_mapping(context)
+        if not context_payload and isinstance(context, str):
+            context_payload = {"text": context}
+        payload: dict[str, Any] = {
+            "mention": name,
+            "hint_type": entity_type,
+            "context": context_payload,
+        }
+        extra_payload = _ensure_mapping(extra)
+        if extra_payload:
+            payload["extra"] = extra_payload
 
-        key = self._normalize(name)
-        canonical_id = canonical_id or key
-        record = self._entities.get(canonical_id)
-        now = time.monotonic()
-        adaptive_weight = weight if weight is not None else self._weighter.score("register", entity_type, record)
-        if record:
-            record.bump(adaptive_weight, decay_rate=self._decay_rate, context=context, now=now)
-        else:
-            initial_popularity = _sigmoid(adaptive_weight)
-            record = EntityRecord(
-                canonical_id=canonical_id,
-                name=name,
-                entity_type=entity_type,
-                popularity=initial_popularity,
-                activation=_logit(initial_popularity),
-                last_update=now,
-            )
-            self._entities[canonical_id] = record
-        self._aliases[key] = canonical_id
-        self._bump_context(canonical_id, context, adaptive_weight)
-        return canonical_id
+        response = self._call_llm("resolve", payload)
+        entity_payload = response.get("entity")
+        entry = EntityEntry.from_payload(
+            entity_payload or {},
+            fallback_id=self._normalize(name) or name,
+            fallback_name=name,
+            fallback_type=entity_type,
+        )
+        aliases = response.get("aliases")
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        elif not isinstance(aliases, Iterable):
+            aliases = []
+        self._store_entry(entry, aliases=aliases)
+        return entry
 
-    def alias(
-        self,
-        alias: str,
-        canonical_id: str,
-        *,
-        weight: Optional[float] = None,
-        context: Optional[str] = None,
-    ) -> None:
-        record = self._entities.get(canonical_id)
-        if not record:
-            return
-        self._aliases[self._normalize(alias)] = canonical_id
-        adaptive_weight = weight if weight is not None else self._weighter.score("alias", record.entity_type, record)
-        record.bump(adaptive_weight, decay_rate=self._decay_rate, context=context)
-        self._bump_context(canonical_id, context, adaptive_weight)
-
-    # ------------------------------------------------------------------
     def resolve(
         self,
         name: str,
         *,
         entity_type: Optional[str] = None,
-        context: Optional[str] = None,
-    ) -> Tuple[str, str]:
-        """Returns (canonical_id, entity_type)."""
-
-        norm = self._normalize(name)
-        canonical = self._aliases.get(norm)
-        now = time.monotonic()
-        if canonical:
-            record = self._entities[canonical]
-            record.bump(self._weighter.score("resolve", record.entity_type, record), decay_rate=self._decay_rate, context=context, now=now)
-            if entity_type and record.entity_type != entity_type:
-                record.entity_type = entity_type
-            self._bump_context(canonical, context, 0.01)
-            return canonical, record.entity_type
-
-        llm_choice = self._llm_resolve(
+        context: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> tuple[str, str]:
+        entry = self.resolve_entry(
             name,
             entity_type=entity_type,
             context=context,
+            extra=extra,
         )
-        if llm_choice:
-            canonical_id, resolved_type, justification = llm_choice
-            if canonical_id in self._entities:
-                record = self._entities[canonical_id]
-            else:
-                record = EntityRecord(
-                    canonical_id=canonical_id,
-                    name=name,
-                    entity_type=resolved_type or entity_type or "Entity",
-                    popularity=0.6,
-                )
-                self._entities[canonical_id] = record
-            record.bump(
-                self._weighter.score("resolve", record.entity_type, record),
-                decay_rate=self._decay_rate,
-                context=context,
-                now=now,
-            )
-            if resolved_type and record.entity_type != resolved_type:
-                record.entity_type = resolved_type
-            if justification:
-                self._bump_context(canonical_id, context, 0.03)
-            self._aliases[norm] = canonical_id
-            return canonical_id, record.entity_type
+        return entry.canonical_id, entry.entity_type
 
-        candidates = []
-        if context:
-            context_scores = self._context_usage.get(context, {})
-            for canonical_id, record in self._entities.items():
-                if entity_type and record.entity_type != entity_type:
-                    continue
-                score = record.contextual_popularity(context) + context_scores.get(canonical_id, 0.0)
-                candidates.append((score, canonical_id, record))
-        if candidates:
-            score, canonical_id, record = max(candidates, key=lambda item: item[0])
-            if score > 0.5:
-                self._aliases[norm] = canonical_id
-                record.bump(self._weighter.score("alias", record.entity_type, record), decay_rate=self._decay_rate, context=context, now=now)
-                self._bump_context(canonical_id, context, 0.02)
-                if entity_type and record.entity_type != entity_type:
-                    record.entity_type = entity_type
-                return canonical_id, record.entity_type
-
-        canonical_id = self.register(name, entity_type or "Entity", canonical_id=norm, context=context)
-        record = self._entities[canonical_id]
-        if entity_type and record.entity_type != entity_type:
-            record.entity_type = entity_type
-        return canonical_id, record.entity_type
-
-    def _llm_resolve(
+    def register(
         self,
         name: str,
+        entity_type: str,
         *,
-        entity_type: Optional[str],
-        context: Optional[str],
-    ) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
-        payload = {
-            "mention": name,
-            "entity_type": entity_type,
-            "context": context,
-            "known_entities": [
-                {
-                    "canonical_id": canonical_id,
-                    "name": record.name,
-                    "entity_type": record.entity_type,
-                    "popularity": record.popularity,
-                }
-                for canonical_id, record in list(self._entities.items())[:50]
-            ],
-        }
-        response = try_call_llm_dict(
-            "entity_linker",
-            input_payload=payload,
-            logger=LOGGER,
+        context: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> str:
+        entry = self.resolve_entry(
+            name,
+            entity_type=entity_type,
+            context=context,
+            extra=extra,
         )
-        if not response:
-            return None
-        canonical = response.get("canonical_entity")
-        if not canonical or not isinstance(canonical, str):
-            return None
-        resolved_type = response.get("resolved_type") or response.get("entity_type")
-        if resolved_type is not None and not isinstance(resolved_type, str):
-            resolved_type = None
-        justification = response.get("justification")
-        if justification is not None and not isinstance(justification, str):
-            justification = None
-        return canonical, resolved_type, justification
+        return entry.canonical_id
+
+    def alias(self, alias: str, canonical_id: str) -> None:
+        entry = self._entities.get(canonical_id)
+        if not entry:
+            return
+        entry.aliases.add(alias)
+        self._aliases[self._normalize(alias)] = canonical_id
+
+    def merge(self, preferred: str, duplicate: str) -> None:
+        payload = {"preferred": preferred, "duplicate": duplicate}
+        response = self._call_llm("merge", payload)
+        canonical = str(response.get("canonical_id") or preferred).strip() or preferred
+        merged_aliases = _ensure_str_list(response.get("aliases"))
+        entry = self._entities.get(canonical)
+        if entry is None:
+            entry = EntityEntry.from_payload(
+                response.get("entity") or {},
+                fallback_id=canonical,
+                fallback_name=canonical,
+                fallback_type=None,
+            )
+        entry.aliases.update(merged_aliases)
+        self._store_entry(entry)
+        self._aliases[self._normalize(duplicate)] = canonical
 
     # ------------------------------------------------------------------
-    def merge(self, preferred: str, duplicate: str) -> None:
-        """Fuses two entity identifiers, updating aliases."""
-
-        preferred_norm = self._normalize(preferred)
-        dup_norm = self._normalize(duplicate)
-        if preferred_norm == dup_norm:
-            return
-
-        pref_id = self._aliases.get(preferred_norm, preferred_norm)
-        dup_id = self._aliases.get(dup_norm, dup_norm)
-
-        if dup_id == pref_id:
-            return
-
-        pref_record = self._entities.get(pref_id)
-        dup_record = self._entities.pop(dup_id, None)
-        if not pref_record or not dup_record:
-            return
-
-        weight = self._weighter.score("merge", pref_record.entity_type, pref_record)
-        pref_record.bump(weight + dup_record.popularity, decay_rate=self._decay_rate)
-        self._aliases[dup_norm] = pref_id
-        for alias, canonical in list(self._aliases.items()):
-            if canonical == dup_id:
-                self._aliases[alias] = pref_id
-        for context, mapping in self._context_usage.items():
-            if dup_id in mapping:
-                mapping[pref_id] += mapping.pop(dup_id)
-
-    def get(self, canonical_id: str) -> Optional[EntityRecord]:
+    def get(self, canonical_id: str) -> Optional[EntityEntry]:
         return self._entities.get(canonical_id)
 
-    def known_entities(self) -> Dict[str, EntityRecord]:
+    def known_entities(self) -> Mapping[str, EntityEntry]:
         return dict(self._entities)
 
     def canonical_form(self, name: str) -> str:
         norm = self._normalize(name)
         return self._aliases.get(norm, norm)
+
+
+__all__ = ["EntityEntry", "EntityLinker"]

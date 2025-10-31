@@ -1,375 +1,218 @@
-"""Registry for autonomous evaluation signals created by the agent.
-
-This lightweight helper keeps track of every self-defined metric that an
-autonomous intention introduces.  It allows any module to discover newly
-created signals, push fresh observations and query the latest values without
-requiring the metric to be pre-declared in the codebase.
-"""
+"""LLM-only autonomous signal registry."""
 
 from __future__ import annotations
 
-import logging
-import re
 import time
 from dataclasses import dataclass, field
-import unicodedata
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
-from AGI_Evolutive.utils.jsonsafe import json_sanitize
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import LLMIntegrationError, get_llm_manager
 
 
-logger = logging.getLogger(__name__)
+class AutoSignalError(RuntimeError):
+    """Raised when the LLM payload for auto signals is invalid."""
+
+
+def _coerce_string(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_mapping(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(key): val for key, val in value.items()}
+
+
+def _coerce_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    items: List[str] = []
+    if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+        for item in value:
+            if isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    items.append(cleaned)
+    return items
+
+
+def _ensure_metric(definition: MutableMapping[str, Any], *, fallback: str) -> str:
+    metric = _coerce_string(definition.get("metric"))
+    if metric:
+        definition["metric"] = metric
+        return metric
+    name = _coerce_string(definition.get("name")) or fallback
+    definition["metric"] = name
+    return name
 
 
 @dataclass
 class AutoSignal:
-    """Metadata tracked for a single autonomous signal."""
+    """Structured representation of an autonomous signal definition."""
 
     action_type: str
     name: str
     metric: str
-    target: float
     direction: str
-    weight: float
+    target: Optional[float]
+    weight: Optional[float]
+    source: str
     metadata: Dict[str, Any] = field(default_factory=dict)
     last_value: Optional[float] = None
     last_source: Optional[str] = None
     last_updated: float = 0.0
 
-    def to_observation(self) -> Optional[float]:
-        if self.last_value is None:
-            return None
-        try:
-            return float(self.last_value)
-        except (TypeError, ValueError):
-            return None
-
-
-def extract_keywords(*chunks: str) -> List[str]:
-    """Return distinct lowercase keywords from the provided chunks."""
-
-    words: Dict[str, None] = {}
-    for chunk in chunks:
-        if not chunk:
-            continue
-        for word in re.findall(r"[\w']+", chunk.lower()):
-            if len(word) < 4:
-                continue
-            words.setdefault(word, None)
-    return list(words.keys())
-
-
-NEGATIVE_HINTS = {
-    "risk",
-    "stress",
-    "fatigue",
-    "burnout",
-    "cost",
-    "tension",
-    "latency",
-    "delay",
-    "error",
-    "debt",
-    "conflict",
-    "overload",
-}
-
-
-def _normalise_keyword(keyword: str) -> str:
-    normalized = unicodedata.normalize("NFKD", keyword or "").encode("ascii", "ignore").decode("ascii")
-    normalized = normalized.lower()
-    normalized = re.sub(r"[^a-z0-9]+", "_", normalized)
-    normalized = re.sub(r"_+", "_", normalized).strip("_")
-    return normalized
-
-
-def _metric_from_keyword(token: str) -> str:
-    intrinsic_suffixes = (
-        "score",
-        "rate",
-        "ratio",
-        "depth",
-        "balance",
-        "quality",
-        "accuracy",
-        "intensity",
-        "alignment",
-        "stability",
-        "consistency",
-        "fluency",
-        "coverage",
-        "confidence",
-    )
-    for suffix in intrinsic_suffixes:
-        if token.endswith(suffix):
-            return token
-
-    derived_suffixes = (
-        ("ship", "index"),
-        ("ness", "index"),
-        ("ment", "progress"),
-        ("tion", "progress"),
-        ("sion", "progress"),
-        ("ance", "stability"),
-        ("ence", "stability"),
-        ("ity", "quality"),
-        ("acy", "quality"),
-        ("ure", "consistency"),
-        ("ing", "consistency"),
-    )
-    for suffix, addition in derived_suffixes:
-        if token.endswith(suffix):
-            return f"{token}_{addition}"
-
-    if len(token) <= 4:
-        return f"{token}_score"
-    return f"{token}_level"
-
-
-def _direction_for_keyword(token: str) -> str:
-    if any(hint in token for hint in NEGATIVE_HINTS):
-        return "below"
-    return "above"
-
-
-def _target_for_keyword(token: str, position: int, total: int) -> float:
-    length_factor = min(1.0, len(token) / 12.0)
-    vowel_ratio = sum(1 for char in token if char in "aeiou") / max(1, len(token))
-    order_bonus = 0.12 * (1.0 - (position / max(1, total)))
-    base = 0.55 + 0.25 * length_factor + 0.1 * vowel_ratio + order_bonus
-    return round(max(0.55, min(0.95, base)), 3)
-
-
-def _weight_for_keyword(position: int, total: int) -> float:
-    if total <= 0:
-        return 1.0
-    spread = max(0.0, (total - position - 1) / max(1, total - 1))
-    return round(1.0 + 0.4 * spread, 3)
-
-
-def _derive_signal_templates(
-    base: str,
-    keywords: Sequence[str],
-    requirements: Optional[Sequence[str]] = None,
-) -> List[Dict[str, Any]]:
-    templates: List[Dict[str, Any]] = []
-    seen_names: Dict[str, None] = {}
-
-    ordered_tokens: List[tuple[str, str]] = []
-    for raw_keyword in keywords:
-        normalised = _normalise_keyword(raw_keyword)
-        if not normalised:
-            continue
-        if normalised in seen_names:
-            continue
-        seen_names[normalised] = None
-        ordered_tokens.append((raw_keyword, normalised))
-
-    limit = min(len(ordered_tokens), 8)
-
-    def add(
-        token: str,
-        metric: str,
-        target: float,
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
         *,
-        direction: str = "above",
-        weight: float = 1.0,
-        prefix: Optional[str] = None,
-        source_keyword: Optional[str] = None,
-    ) -> None:
-        name_token = _normalise_keyword(token) or _normalise_keyword(metric) or "metric"
-        if prefix:
-            name_token = f"{prefix}_{name_token}"
-        signal_name = f"{base}__{name_token}"
-        if signal_name in seen_names:
-            return
-        seen_names[signal_name] = None
-        entry = {
-            "name": signal_name,
-            "metric": metric,
-            "target": target,
-            "direction": direction,
-            "weight": weight,
+        action_type: str,
+    ) -> "AutoSignal":
+        if not isinstance(payload, Mapping):
+            raise AutoSignalError("Signal payload must be a mapping")
+        data: MutableMapping[str, Any] = dict(payload)
+        metric = _ensure_metric(data, fallback=f"{action_type}_signal")
+        name = _coerce_string(data.get("name")) or metric
+        direction = _coerce_string(data.get("direction")) or "above"
+        target = _coerce_float(data.get("target"))
+        weight = _coerce_float(data.get("weight"))
+        source = _coerce_string(data.get("source")) or "auto_evolution"
+        metadata = _coerce_mapping(data.get("metadata"))
+        return cls(
+            action_type=str(action_type),
+            name=name,
+            metric=metric,
+            direction=direction.lower(),
+            target=target,
+            weight=weight,
+            source=source,
+            metadata=metadata,
+        )
+
+    def to_observation(self) -> Optional[float]:
+        return self.last_value
+
+
+@dataclass
+class AutoSignalDerivationRequest:
+    """Payload forwarded to the LLM for signal derivation."""
+
+    action_type: str
+    description: str
+    requirements: Sequence[str] = field(default_factory=tuple)
+    hints: Sequence[str] = field(default_factory=tuple)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "action_type": self.action_type,
+            "description": self.description,
         }
-        if source_keyword:
-            entry["source_keyword"] = source_keyword
-        templates.append(entry)
-
-    for idx, (raw_keyword, token) in enumerate(ordered_tokens[:limit]):
-        metric = _metric_from_keyword(token)
-        direction = _direction_for_keyword(token)
-        target = _target_for_keyword(token, idx, max(1, limit))
-        weight = _weight_for_keyword(idx, max(1, limit))
-        add(token, metric, target, direction=direction, weight=weight, source_keyword=raw_keyword)
-
-    if requirements:
-        seen_requirements: Dict[str, None] = {}
-        for req in requirements:
-            normalized_req = _normalise_keyword(str(req))
-            if not normalized_req or normalized_req in seen_requirements:
-                continue
-            seen_requirements[normalized_req] = None
-            metric = f"requirement:{normalized_req}"
-            target = round(0.62 + 0.05 * min(len(seen_requirements), 4), 3)
-            add(normalized_req, metric, target, prefix="requirement", source_keyword=str(req))
-
-    return templates
+        if self.requirements:
+            payload["requirements"] = _coerce_string_list(self.requirements)
+        if self.hints:
+            payload["hints"] = _coerce_string_list(self.hints)
+        if self.metadata:
+            payload["metadata"] = _coerce_mapping(self.metadata)
+        return payload
 
 
-def _heuristic_signal_derivation(
-    action_type: str,
-    description: str,
-    *,
-    requirements: Optional[Sequence[str]] = None,
-    hints: Optional[Sequence[str]] = None,
-) -> List[Dict[str, Any]]:
-    base = str(action_type or "auto").replace(" ", "_")
-    signals: List[Dict[str, Any]] = [
-        {
-            "name": f"{base}__success",
-            "metric": "success_rate",
-            "target": 0.8,
-            "direction": "above",
-        },
-        {
-            "name": f"{base}__confidence",
-            "metric": "confidence",
-            "target": 0.7,
-            "direction": "above",
-        },
-        {
-            "name": f"{base}__consistency",
-            "metric": "consistency",
-            "target": 0.6,
-            "direction": "above",
-        },
-    ]
+@dataclass
+class AutoSignalRegistrationRequest:
+    """Payload for registering signals with the LLM contract."""
 
-    chunks = [description]
-    if requirements:
-        chunks.append(" ".join(str(req) for req in requirements))
-    if hints:
-        chunks.append(" ".join(str(hint) for hint in hints))
+    action_type: str
+    signals: Sequence[Mapping[str, Any]]
+    evaluation: Optional[Mapping[str, Any]] = None
+    blueprint: Optional[Mapping[str, Any]] = None
+    description: Optional[str] = None
+    requirements: Sequence[str] = field(default_factory=tuple)
+    hints: Sequence[str] = field(default_factory=tuple)
 
-    keywords = extract_keywords(*chunks)
-    if not keywords:
-        return signals
-
-    extra = _derive_signal_templates(base, keywords, requirements=requirements)
-    existing = {signal["name"] for signal in signals}
-    for candidate in extra:
-        if candidate.get("name") not in existing:
-            signals.append(candidate)
-            existing.add(candidate.get("name"))
-
-    return signals
-
-
-def _llm_signal_derivation(
-    action_type: str,
-    description: str,
-    *,
-    requirements: Optional[Sequence[str]] = None,
-    hints: Optional[Sequence[str]] = None,
-    baseline: Optional[Sequence[Mapping[str, Any]]] = None,
-) -> List[Dict[str, Any]]:
-    payload = json_sanitize({
-        "action_type": action_type,
-        "description": description,
-        "requirements": [str(req) for req in (requirements or [])],
-        "hints": [str(hint) for hint in (hints or [])],
-        "baseline": list(baseline or []),
-    })
-    response = try_call_llm_dict(
-        "autonomy_signal_derivation",
-        input_payload=payload,
-        logger=logger,
-    )
-    if not isinstance(response, Mapping):
-        return []
-
-    candidates = response.get("signals")
-    if not isinstance(candidates, list):
-        return []
-
-    parsed: List[Dict[str, Any]] = []
-    for entry in candidates:
-        if not isinstance(entry, Mapping):
-            continue
-        name = str(entry.get("name") or "").strip()
-        metric = str(entry.get("metric") or name or "").strip()
-        if not metric:
-            continue
-        if not name:
-            name = metric
-        try:
-            target = float(entry.get("target", 0.7))
-        except (TypeError, ValueError):
-            target = 0.7
-        try:
-            weight = float(entry.get("weight", 1.0))
-        except (TypeError, ValueError):
-            weight = 1.0
-        direction = str(entry.get("direction", "above") or "above").lower()
-        if direction not in {"above", "below"}:
-            direction = "above"
-        candidate: Dict[str, Any] = {
-            "name": name,
-            "metric": metric,
-            "target": max(0.0, min(1.5, target)),
-            "direction": direction,
-            "weight": weight,
+    def to_payload(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "action_type": self.action_type,
+            "signals": [
+                _coerce_mapping(signal)
+                for signal in self.signals
+                if isinstance(signal, Mapping)
+            ],
         }
-        for optional_key in ("source_keyword", "notes", "rationale"):
-            if entry.get(optional_key):
-                candidate[optional_key] = entry[optional_key]
-        parsed.append(candidate)
-    return parsed
-
-
-def derive_signals_for_description(
-    action_type: str,
-    description: str,
-    *,
-    requirements: Optional[Sequence[str]] = None,
-    hints: Optional[Sequence[str]] = None,
-) -> List[Dict[str, Any]]:
-    """Generate autonomous signal definitions from textual hints."""
-
-    baseline = _heuristic_signal_derivation(
-        action_type,
-        description,
-        requirements=requirements,
-        hints=hints,
-    )
-    llm_candidates = _llm_signal_derivation(
-        action_type,
-        description,
-        requirements=requirements,
-        hints=hints,
-        baseline=baseline,
-    )
-    if not llm_candidates:
-        return baseline
-
-    existing = {(sig.get("name"), sig.get("metric")) for sig in baseline}
-    for candidate in llm_candidates:
-        key = (candidate.get("name"), candidate.get("metric"))
-        if not candidate.get("metric"):
-            continue
-        if key in existing:
-            continue
-        baseline.append(candidate)
-        existing.add(key)
-    return baseline
+        if self.evaluation:
+            payload["evaluation"] = _coerce_mapping(self.evaluation)
+        if self.blueprint:
+            payload["blueprint"] = _coerce_mapping(self.blueprint)
+        if self.description:
+            payload["description"] = self.description
+        if self.requirements:
+            payload["requirements"] = _coerce_string_list(self.requirements)
+        if self.hints:
+            payload["hints"] = _coerce_string_list(self.hints)
+        return payload
 
 
 class AutoSignalRegistry:
-    """Dynamic catalogue of self-generated metrics."""
+    """Delegates autonomous signal lifecycle to a single LLM contract."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, llm_manager=None) -> None:
+        self._manager = llm_manager or get_llm_manager()
         self._signals: Dict[str, Dict[str, AutoSignal]] = {}
+        self.last_derivation: Optional[Dict[str, Any]] = None
+        self.last_registration: Optional[Dict[str, Any]] = None
+
+    # ------------------------------------------------------------------
+    def _call_contract(self, spec: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
+        try:
+            response = self._manager.call_dict(spec, input_payload=dict(payload))
+        except LLMIntegrationError as exc:  # pragma: no cover - passthrough
+            raise AutoSignalError(str(exc)) from exc
+        if not isinstance(response, Mapping):
+            raise AutoSignalError("LLM did not return a mapping payload")
+        return {str(key): value for key, value in response.items()}
+
+    # ------------------------------------------------------------------
+    def derive(
+        self,
+        action_type: str,
+        description: str,
+        *,
+        requirements: Optional[Sequence[str]] = None,
+        hints: Optional[Sequence[str]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        request = AutoSignalDerivationRequest(
+            action_type=str(action_type),
+            description=description,
+            requirements=requirements or (),
+            hints=hints or (),
+            metadata=metadata or {},
+        )
+        payload = self._call_contract("auto_signal_derivation", request.to_payload())
+        self.last_derivation = payload
+        candidates = payload.get("signals")
+        if not isinstance(candidates, Iterable) or isinstance(candidates, (str, bytes, bytearray)):
+            raise AutoSignalError("LLM derivation payload missing 'signals'")
+        result: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            if isinstance(candidate, Mapping):
+                result.append({str(key): value for key, value in candidate.items()})
+        return result
 
     # ------------------------------------------------------------------
     def register(
@@ -383,104 +226,35 @@ class AutoSignalRegistry:
         requirements: Optional[Sequence[str]] = None,
         hints: Optional[Sequence[str]] = None,
     ) -> List[AutoSignal]:
-        """Declare or update the signal definitions for an autonomous action."""
-
+        catalogue = self._signals.setdefault(str(action_type), {})
+        request = AutoSignalRegistrationRequest(
+            action_type=str(action_type),
+            signals=signals or (),
+            evaluation=evaluation,
+            blueprint=blueprint,
+            description=description,
+            requirements=requirements or (),
+            hints=hints or (),
+        )
+        payload = self._call_contract("auto_signal_registration", request.to_payload())
+        self.last_registration = payload
+        returned = payload.get("signals")
+        if not isinstance(returned, Iterable) or isinstance(returned, (str, bytes, bytearray)):
+            raise AutoSignalError("LLM registration payload missing 'signals'")
         registered: List[AutoSignal] = []
-        if not action_type:
-            return registered
-
-        store = self._signals.setdefault(str(action_type), {})
-
-        if (not signals or all(not signal for signal in signals)) and description:
-            signals = derive_signals_for_description(
-                action_type,
-                description,
-                requirements=requirements,
-                hints=hints,
-            )
-        elif signals is None:
-            signals = []
-
-        baseline = None
-        if isinstance(evaluation, Mapping):
-            try:
-                baseline = float(evaluation.get("score", evaluation.get("significance", 0.5)))
-            except (TypeError, ValueError):
-                baseline = None
-        checkpoints = []
-        if isinstance(blueprint, Mapping):
-            checkpoints = blueprint.get("checkpoints", [])  # type: ignore[assignment]
-
-        for signal in signals:
-            if not isinstance(signal, Mapping):
+        for entry in returned:
+            if not isinstance(entry, Mapping):
                 continue
-            name = str(signal.get("name") or signal.get("metric") or "").strip()
-            metric = str(signal.get("metric") or name).strip()
-            if not metric:
-                continue
-            try:
-                target = float(signal.get("target", 0.6) or 0.6)
-            except (TypeError, ValueError):
-                target = 0.6
-            direction = str(signal.get("direction", "above") or "above").lower()
-            try:
-                weight = float(signal.get("weight", 1.0) or 1.0)
-            except (TypeError, ValueError):
-                weight = 1.0
-            entry = store.get(metric)
-            metadata = {
-                "name": name or metric,
-                "target": target,
-                "direction": direction,
-                "weight": weight,
-                "source": str(signal.get("source") or "auto_evolution"),
-            }
-            for checkpoint in checkpoints:
-                if isinstance(checkpoint, Mapping) and str(checkpoint.get("metric")) == metric:
-                    metadata.setdefault("reward_if_met", checkpoint.get("reward_if_met"))
-                    metadata.setdefault("penalty_if_missed", checkpoint.get("penalty_if_missed"))
-            if entry is None:
-                entry = AutoSignal(
-                    action_type=str(action_type),
-                    name=metadata["name"],
-                    metric=metric,
-                    target=target,
-                    direction=direction,
-                    weight=weight,
-                    metadata=metadata,
-                )
-                if baseline is not None:
-                    entry.last_value = baseline
-                    entry.last_source = "baseline"
-                    entry.last_updated = time.time()
-                store[metric] = entry
-            else:
-                entry.target = target
-                entry.direction = direction
-                entry.weight = weight
-                entry.metadata.update(metadata)
-                if baseline is not None and entry.last_value is None:
-                    entry.last_value = baseline
-                    entry.last_source = "baseline"
-                    entry.last_updated = time.time()
-            registered.append(entry)
+            signal = AutoSignal.from_payload(entry, action_type=str(action_type))
+            value = _coerce_float(entry.get("last_value"))
+            if value is not None:
+                signal.last_value = value
+                signal.last_source = _coerce_string(entry.get("last_source")) or "llm"
+                signal.last_updated = float(entry.get("last_updated", time.time()) or time.time())
+            catalogue[signal.metric] = signal
+            registered.append(signal)
         return registered
 
-    # ------------------------------------------------------------------
-    def derive(
-        self,
-        action_type: str,
-        description: str,
-        *,
-        requirements: Optional[Sequence[str]] = None,
-        hints: Optional[Sequence[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        return derive_signals_for_description(
-            action_type,
-            description,
-            requirements=requirements,
-            hints=hints,
-        )
     # ------------------------------------------------------------------
     def record(
         self,
@@ -491,28 +265,22 @@ class AutoSignalRegistry:
         source: Optional[str] = None,
         timestamp: Optional[float] = None,
     ) -> Optional[AutoSignal]:
-        """Store an observation for a metric, creating it on-the-fly if needed."""
-
         if not action_type or not metric:
             return None
-        store = self._signals.setdefault(str(action_type), {})
-        key = str(metric)
-        entry = store.get(key)
+        catalogue = self._signals.setdefault(str(action_type), {})
+        entry = catalogue.get(metric)
         if entry is None:
             entry = AutoSignal(
                 action_type=str(action_type),
-                name=key,
-                metric=key,
-                target=0.6,
+                name=metric,
+                metric=metric,
                 direction="above",
-                weight=1.0,
-                metadata={"name": key, "target": 0.6, "direction": "above", "weight": 1.0},
+                target=None,
+                weight=None,
+                source=source or "observation",
             )
-            store[key] = entry
-        try:
-            entry.last_value = float(value)
-        except (TypeError, ValueError):
-            return entry
+            catalogue[metric] = entry
+        entry.last_value = _coerce_float(value)
         entry.last_source = source or entry.last_source
         entry.last_updated = timestamp or time.time()
         return entry
@@ -526,42 +294,87 @@ class AutoSignalRegistry:
         source: Optional[str] = None,
         timestamp: Optional[float] = None,
     ) -> List[AutoSignal]:
-        """Convenience wrapper to record many metrics at once."""
-
         observations: List[AutoSignal] = []
-        for key, value in metrics.items():
-            if not key:
+        for metric, value in metrics.items():
+            metric_name = _coerce_string(metric)
+            if not metric_name:
                 continue
-            entry = self.record(action_type, key, value, source=source, timestamp=timestamp)
+            entry = self.record(
+                action_type,
+                metric_name,
+                value,
+                source=source,
+                timestamp=timestamp,
+            )
             if entry is not None:
                 observations.append(entry)
         return observations
 
     # ------------------------------------------------------------------
     def get_signals(self, action_type: str) -> List[AutoSignal]:
-        store = self._signals.get(str(action_type))
-        if not store:
+        catalogue = self._signals.get(str(action_type))
+        if not catalogue:
             return []
-        return list(store.values())
+        return list(catalogue.values())
 
     # ------------------------------------------------------------------
     def get_observations(self, action_type: str) -> Dict[str, float]:
-        observed: Dict[str, float] = {}
+        observations: Dict[str, float] = {}
         for signal in self.get_signals(action_type):
-            obs = signal.to_observation()
-            if obs is not None:
-                observed[signal.metric] = obs
-        return observed
+            value = signal.to_observation()
+            if value is not None:
+                observations[signal.metric] = value
+        return observations
 
     # ------------------------------------------------------------------
     def actions(self) -> Iterable[str]:
         return list(self._signals.keys())
 
 
+def extract_keywords(*chunks: str, llm_manager=None) -> List[str]:
+    """Delegate keyword extraction to the LLM."""
+
+    joined = "\n".join(chunk for chunk in chunks if chunk)
+    if not joined:
+        return []
+    manager = llm_manager or get_llm_manager()
+    try:
+        response = manager.call_dict(
+            "auto_signal_keywords",
+            input_payload={"text": joined},
+        )
+    except LLMIntegrationError as exc:  # pragma: no cover - passthrough
+        raise AutoSignalError(str(exc)) from exc
+    if not isinstance(response, Mapping):
+        raise AutoSignalError("LLM keyword payload must be a mapping")
+    return _coerce_string_list(response.get("keywords"))
+
+
+def derive_signals_for_description(
+    action_type: str,
+    description: str,
+    *,
+    requirements: Optional[Sequence[str]] = None,
+    hints: Optional[Sequence[str]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+    llm_manager=None,
+) -> List[Dict[str, Any]]:
+    """Helper that mirrors :meth:`AutoSignalRegistry.derive` without state."""
+
+    registry = AutoSignalRegistry(llm_manager=llm_manager)
+    return registry.derive(
+        action_type,
+        description,
+        requirements=requirements,
+        hints=hints,
+        metadata=metadata,
+    )
+
+
 __all__ = [
     "AutoSignal",
+    "AutoSignalError",
     "AutoSignalRegistry",
     "derive_signals_for_description",
     "extract_keywords",
 ]
-

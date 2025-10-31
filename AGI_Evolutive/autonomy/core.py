@@ -1,13 +1,28 @@
+"""LLM-first autonomy scheduler.
+
+Ce module supprime la chaîne heuristique historique (régressions logistiques,
+EMAs adaptatives, bandits) au profit d'un unique aller-retour LLM qui produit
+la micro-étape à exécuter pendant les périodes d'inactivité.  L'autonomie se
+résume désormais à :
+
+1. Collecter un instantané léger du contexte (objectif prioritaire, signaux
+   disponibles sur l'architecture, propositions éventuelles).
+2. Déléguer la décision complète au contrat ``autonomy_core`` via
+   :func:`try_call_llm_dict`.
+3. Appliquer la réponse structurée (hypothèses, tests, preuve, décision,
+   progression) et journaliser le résultat.
+
+Le but est d'assurer que l'intégralité de la stratégie d'autonomie soit
+apprise/optimisée côté modèle, sans fallback heuristique.
+"""
+
 from __future__ import annotations
 
-import math
-import random
+import logging
 import threading
 import time
-
-import logging
-
-from typing import Any, Dict, List, Mapping, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 
 from AGI_Evolutive.goals.dag_store import GoalDAG
 from AGI_Evolutive.reasoning.structures import (
@@ -17,401 +32,428 @@ from AGI_Evolutive.reasoning.structures import (
     episode_record,
 )
 from AGI_Evolutive.runtime.logger import JSONLLogger
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from AGI_Evolutive.utils.llm_service import (
+    LLMIntegrationError,
+    LLMUnavailableError,
+    get_llm_manager,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 
-class AutonomyCore:
-    """
-    Scheduler d'autonomie : en idle, choisit un sous-but à forte EVI,
-    exécute UNE petite étape, logge, et propose un prochain test.
-    """
+def _coerce_float(
+    value: Any,
+    *,
+    default: float = 0.0,
+    minimum: float = 0.0,
+    maximum: float = 1.0,
+) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        number = default
+    if number != number:  # NaN
+        number = default
+    return max(minimum, min(maximum, number))
 
-    def __init__(self, arch, logger: JSONLLogger, dag: GoalDAG):
+
+def _coerce_optional_mapping(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, Mapping):
+        return {str(k): v for k, v in value.items()}
+    return None
+
+
+def _ensure_mapping(value: Any) -> Dict[str, Any]:
+    mapping = _coerce_optional_mapping(value)
+    return mapping or {}
+
+
+def _ensure_iterable_of_mappings(value: Any) -> Iterable[Mapping[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        return [value]
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+        return [item for item in value if isinstance(item, Mapping)]
+    return []
+
+
+def _default_hypothesis(goal_id: str) -> Hypothesis:
+    return Hypothesis(
+        content=f"Micro-étape sur {goal_id}",
+        prior=0.5,
+    )
+
+
+def _default_test(goal_id: str) -> Test:
+    return Test(
+        description=f"Identifier une action incrémentale pour {goal_id}",
+        cost_est=0.1,
+        expected_information_gain=0.5,
+    )
+
+
+def _coerce_hypotheses(value: Any, goal_id: str) -> List[Hypothesis]:
+    hypotheses: List[Hypothesis] = []
+    for item in _ensure_iterable_of_mappings(value):
+        content = str(item.get("content") or item.get("hypothesis") or "").strip()
+        if not content:
+            content = f"Hypothèse sur {goal_id}"
+        prior = _coerce_float(item.get("prior"), default=0.5)
+        hypotheses.append(Hypothesis(content=content, prior=prior))
+    if not hypotheses:
+        hypotheses.append(_default_hypothesis(goal_id))
+    return hypotheses
+
+
+def _coerce_tests(value: Any, goal_id: str) -> List[Test]:
+    tests: List[Test] = []
+    for item in _ensure_iterable_of_mappings(value):
+        description = str(
+            item.get("description")
+            or item.get("test")
+            or item.get("action")
+            or ""
+        ).strip()
+        if not description:
+            description = f"Action exploratoire pour {goal_id}"
+        cost_est = _coerce_float(item.get("cost_est"), default=0.15, maximum=10.0)
+        info_gain = _coerce_float(
+            item.get("expected_information_gain"),
+            default=0.5,
+        )
+        tests.append(
+            Test(
+                description=description,
+                cost_est=cost_est,
+                expected_information_gain=info_gain,
+            )
+        )
+    if not tests:
+        tests.append(_default_test(goal_id))
+    return tests
+
+
+def _coerce_evidence(value: Any, goal_id: str) -> Evidence:
+    mapping = _ensure_mapping(value)
+    notes = str(mapping.get("notes") or mapping.get("summary") or "").strip()
+    if not notes:
+        notes = f"Synthèse LLM sur {goal_id}"
+    confidence = _coerce_float(mapping.get("confidence"), default=0.6)
+    return Evidence(notes=notes, confidence=confidence)
+
+
+def _coerce_str(value: Any, *, default: str) -> str:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned:
+            return cleaned
+    return default
+
+
+def _coerce_confidence(value: Any, *, default: float = 0.6) -> float:
+    return _coerce_float(value, default=default, minimum=0.0, maximum=1.0)
+
+
+@dataclass
+class AutonomyLLMOutcome:
+    """Normalized view of the autonomy LLM payload."""
+
+    goal_id: str
+    hypotheses: List[Hypothesis]
+    tests: List[Test]
+    evidence: Evidence
+    decision: Dict[str, Any]
+    progress_step: float
+    final_confidence: float
+    result_text: str
+    metacognition_event: Optional[Dict[str, Any]] = None
+    policy_feedback: Optional[Dict[str, Any]] = None
+    annotations: Dict[str, Any] = field(default_factory=dict)
+    raw: MutableMapping[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Optional[Mapping[str, Any]],
+        *,
+        goal_id: str,
+    ) -> "AutonomyLLMOutcome":
+        payload = payload or {}
+        if not isinstance(payload, Mapping):
+            payload = {}
+
+        hypotheses = _coerce_hypotheses(payload.get("hypotheses"), goal_id)
+        tests = _coerce_tests(payload.get("tests"), goal_id)
+        evidence = _coerce_evidence(payload.get("evidence"), goal_id)
+        decision = _ensure_mapping(payload.get("decision"))
+        if not decision:
+            decision = {
+                "decision": "noop",
+                "reason": "llm_missing_decision",
+                "confidence": 0.0,
+            }
+
+        progress_step = _coerce_float(
+            payload.get("progress_step"),
+            default=0.01,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        final_confidence = _coerce_confidence(
+            payload.get("final_confidence"),
+            default=evidence.confidence,
+        )
+        result_text = _coerce_str(
+            payload.get("result_text"),
+            default=f"Autonomy update for {goal_id}",
+        )
+
+        metacognition_event = _coerce_optional_mapping(
+            payload.get("metacognition_event")
+        )
+        policy_feedback = _coerce_optional_mapping(payload.get("policy_feedback"))
+        annotations = _ensure_mapping(payload.get("annotations"))
+
+        raw: MutableMapping[str, Any] = dict(payload)
+        return cls(
+            goal_id=goal_id,
+            hypotheses=hypotheses,
+            tests=tests,
+            evidence=evidence,
+            decision=decision,
+            progress_step=progress_step,
+            final_confidence=final_confidence,
+            result_text=result_text,
+            metacognition_event=metacognition_event,
+            policy_feedback=policy_feedback,
+            annotations=annotations,
+            raw=raw,
+        )
+
+
+class AutonomyCore:
+    """Idle autonomy scheduler relying exclusively on an LLM contract."""
+
+    def __init__(
+        self,
+        arch,
+        logger: JSONLLogger,
+        dag: GoalDAG,
+        *,
+        llm_manager=None,
+    ):
         self.arch = arch
         self.logger = logger
         self.dag = dag
         self.running = True
-        self.thread = None
-        self.idle_interval = 20  # secondes sans input pour tick
+        self.thread: Optional[threading.Thread] = None
+        self.idle_interval = 20  # seconds of inactivity before triggering a tick
         self._last_user_time = time.time()
         self._tick = 0
-        # Online GLM (logistic regression) weights for hypothesis prior/EVI.
-        self._policy_weights: Dict[str, float] = {
-            "bias": -0.2,
-            "progress": -0.8,
-            "progress_sq": -0.3,
-            "belief": 0.4,
-            "belief_sq": 0.2,
-            "novelty": 0.35,
-            "novelty_sq": 0.15,
-            "evi": 0.6,
-            "evi_progress": 0.4,
-        }
-        self._last_weight_snapshot = dict(self._policy_weights)
-        self._learning_rate = 0.15
-        self._max_step = 0.05
-        self._weight_drift_threshold = 0.12
-        self._ema_betas = (0.2, 0.4, 0.6, 0.8)
-        self._ema_trackers: Dict[str, Dict[str, Any]] = {
-            name: self._init_ema_tracker()
-            for name in ("belief", "novelty", "progress")
-        }
+        self._llm_manager = llm_manager
 
-    def notify_user_activity(self):
+    def notify_user_activity(self) -> None:
         self._last_user_time = time.time()
 
-    def start(self):
+    def start(self) -> None:
         if self.thread and self.thread.is_alive():
             return
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
-    def stop(self):
+    def stop(self) -> None:
         self.running = False
 
-    def _loop(self):
+    def _loop(self) -> None:
         while self.running:
             try:
                 idle_for = time.time() - self._last_user_time
                 if idle_for >= self.idle_interval:
-                    self.tick()
-                    self._last_user_time = time.time()  # évite boucle frénétique
+                    self.tick(idle_for=idle_for)
+                    self._last_user_time = time.time()
                 time.sleep(1.0)
-            except Exception as e:
-                self.logger.write("autonomy.error", error=str(e))
-                time.sleep(5)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.write("autonomy.error", error=str(exc))
+                time.sleep(5.0)
 
-    def tick(self):
+    def tick(self, *, idle_for: Optional[float] = None) -> None:
         self._tick += 1
-        # 1) Choix d'objectif
-        pick = self.dag.choose_next_goal()
-        goal_id, evi, progress = pick["id"], pick["evi"], pick["progress"]
+        goal_pick = self._normalize_goal_pick()
+        goal_id = goal_pick["id"]
 
-        # 2) Hypothèse & test minimal
-        # Prépare signaux pour le modèle online (avec EMA adaptatives).
-        belief_raw = 0.6
-        try:
-            self_model = getattr(self.arch, "self_model", None)
-            if self_model and hasattr(self_model, "belief_confidence"):
-                belief_raw = float(self_model.belief_confidence({}))
-        except Exception as exc:
-            self.logger.write("autonomy.warn", stage="belief_confidence", error=str(exc))
+        proposals = self._collect_proposals()
+        arch_state = self._collect_architecture_state()
 
-        novelty_raw = 0.7
-        try:
-            memory = getattr(self.arch, "memory", None)
-            if memory and hasattr(memory, "get_recent_memories"):
-                raw_recent = memory.get_recent_memories(n=100)
-                recent = [m for m in raw_recent if isinstance(m, dict)] if isinstance(raw_recent, list) else []
-            else:
-                recent = []
-            typs = [m.get("type", m.get("kind")) for m in recent]
-            same = sum(1 for tpe in typs if tpe == "update")
-            novelty_raw = max(0.2, min(0.95, 1.0 - (0.02 * max(0, 5 - same))))
-        except Exception as exc:
-            self.logger.write("autonomy.warn", stage="novelty_eval", error=str(exc))
+        outcome = self._call_llm(goal_pick, proposals, arch_state, idle_for=idle_for)
 
-        belief = self._adaptive_ema_step("belief", belief_raw)
-        novelty_fam = self._adaptive_ema_step("novelty", novelty_raw)
-        progress_smoothed = self._adaptive_ema_step("progress", progress)
-
-        features = self._compute_features(
-            progress_smoothed,
-            belief,
-            novelty_fam,
-            evi,
-        )
-        score = self._linear_score(features)
-        prior = self._sigmoid(score)
-        expected_info_gain = max(0.05, min(0.95, self._sigmoid(score + 0.35)))
-
-        llm_guidance = self._query_llm_guidance(
-            goal_id=goal_id,
-            features=features,
-            belief=belief,
-            novelty=novelty_fam,
-            progress=progress_smoothed,
-            evi=evi,
-            proposals=proposals,
-        )
-
-        h = [
-            Hypothesis(
-                content=f"Une micro-étape sur {goal_id} accélère la compréhension",
-                prior=prior,
-            )
-        ]
-        t = [
-            Test(
-                description=f"Lire/agréger 3 traces récentes et distiller 1 règle pour {goal_id}",
-                cost_est=0.15,
-                expected_information_gain=expected_info_gain,
-            )
-        ]
-
-        # 3) "Exécution" symbolique (sans I/O lourde ici)
-        rule = self._distill_micro_rule(goal_id)
-        ev_confidence = self._sigmoid(score + 0.2)
-        ev = Evidence(notes=f"Règle distillée: {rule}", confidence=ev_confidence)
-
-        # 3bis) Décider d'une action via la policy (si dispo)
-        proposer = getattr(self.arch, "proposer", None)
-        policy = getattr(self.arch, "policy", None)
-        homeo = getattr(self.arch, "homeostasis", None) or getattr(self.arch, "homeo", None)
-        planner = getattr(self.arch, "planner", None)
-        memory = getattr(self.arch, "memory", None)
-        proposals: List[Dict[str, Any]] = []
-        if proposer and hasattr(proposer, "run_once_now"):
-            try:
-                raw_props = proposer.run_once_now() or []
-                if isinstance(raw_props, list):
-                    proposals = [p for p in raw_props if isinstance(p, dict)]
-            except Exception as exc:
-                self.logger.write("autonomy.warn", stage="proposer", error=str(exc))
-
-        decision: Dict[str, Any] = {"decision": "noop", "reason": "no policy", "confidence": 0.5}
-        if policy and hasattr(policy, "decide"):
-            try:
-                decision = policy.decide(
-                    proposals,
-                    self_state={"tick": self._tick},
-                    proposer=proposer,
-                    homeo=homeo,
-                    planner=planner,
-                    ctx={"belief_confidence": belief, "novelty_familiarity": novelty_fam},
-                )
-            except Exception as exc:
-                decision = {"decision": "error", "reason": str(exc), "confidence": 0.3}
-                self.logger.write("autonomy.warn", stage="policy_decide", error=str(exc))
-
-        if llm_guidance:
-            decision = dict(decision)
-            decision.setdefault("llm_guidance", llm_guidance)
-
-        # 4) Mise à jour DAG + logs
-        progress_step = max(0.002, min(0.02, prior * 0.02))
-        progress_after = self.dag.bump_progress(progress_step)
+        progress_after = self.dag.bump_progress(outcome.progress_step)
         ep = episode_record(
             user_msg="[idle]",
-            hypotheses=h,
+            hypotheses=outcome.hypotheses,
             chosen_index=0,
-            tests=t,
-            evidence=ev,
-            result_text=f"Micro-étape sur {goal_id}: {rule}",
-            final_confidence=self._sigmoid(score + 0.1),
+            tests=outcome.tests,
+            evidence=outcome.evidence,
+            result_text=outcome.result_text,
+            final_confidence=outcome.final_confidence,
         )
+
         self.logger.write(
             "autonomy.tick",
             goal=goal_id,
-            evi=evi,
-            progress_before=progress,
-            progress_after=progress_after,
+            goal_state=goal_pick,
+            proposals=proposals,
+            arch_state=arch_state,
             episode=ep,
-            policy_decision=decision,
-            hedonic_signal=getattr(self.arch, "phenomenal_kernel_state", {}).get("hedonic_reward") if getattr(self.arch, "phenomenal_kernel_state", None) else None,
+            decision=outcome.decision,
+            annotations=outcome.annotations,
+            llm_payload=outcome.raw,
+            progress_before=goal_pick.get("progress"),
+            progress_after=progress_after,
         )
 
-        # 5) Ping métacognition (si existante)
-        try:
-            if hasattr(self.arch, "metacognition") and self.arch.metacognition:
-                self.arch.metacognition._record_metacognitive_event(
-                    event_type="autonomy_step",
-                    domain=
-                    self.arch.metacognition.CognitiveDomain.LEARNING
-                    if hasattr(self.arch.metacognition, "CognitiveDomain")
-                    else None,
-                    description=f"Idle→micro-étape sur {goal_id}",
-                    significance=min(0.3 + 0.4 * evi, 0.9),
-                    confidence=0.6,
-                )
-        except Exception:
-            pass
+        self._apply_metacognition(outcome)
+        self._apply_policy_feedback(outcome)
 
-        # 6) Feedback à la policy
+    # ------------------------------------------------------------------
+    # Payload construction helpers
+
+    def _normalize_goal_pick(self) -> Dict[str, Any]:
         try:
-            executed = decision.get("proposal") if isinstance(decision, dict) else None
-            success = bool(decision.get("decision") == "apply") if isinstance(decision, dict) else False
-            if policy and hasattr(policy, "register_outcome") and executed:
-                policy.register_outcome(executed, success)
+            pick = self.dag.choose_next_goal() or {}
+        except Exception as exc:  # pragma: no cover - defensive logging
+            self.logger.write("autonomy.warn", stage="dag_choose", error=str(exc))
+            pick = {}
+
+        goal_id = _coerce_str(pick.get("id"), default="unknown_goal")
+        evi = _coerce_float(pick.get("evi"), default=0.0, minimum=0.0, maximum=1.0)
+        progress = _coerce_float(
+            pick.get("progress"),
+            default=0.0,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        normalized = {
+            "id": goal_id,
+            "evi": evi,
+            "progress": progress,
+        }
+        for key in ("label", "description", "priority"):
+            if key in pick:
+                normalized[key] = pick[key]
+        return normalized
+
+    def _collect_proposals(self) -> List[Dict[str, Any]]:
+        proposer = getattr(self.arch, "proposer", None)
+        if not proposer or not hasattr(proposer, "run_once_now"):
+            return []
+        try:
+            raw = proposer.run_once_now() or []
+        except Exception as exc:  # pragma: no cover - best effort
+            self.logger.write("autonomy.warn", stage="proposer", error=str(exc))
+            return []
+        proposals: List[Dict[str, Any]] = []
+        if isinstance(raw, Mapping):
+            raw = [raw]
+        if isinstance(raw, Iterable):
+            for item in raw:
+                if isinstance(item, Mapping):
+                    proposals.append({str(k): v for k, v in item.items()})
+        return proposals
+
+    def _collect_architecture_state(self) -> Dict[str, Any]:
+        state: Dict[str, Any] = {
+            "tick": self._tick,
+        }
+        kernel_state = getattr(self.arch, "phenomenal_kernel_state", None)
+        if isinstance(kernel_state, Mapping):
+            state["phenomenal_kernel_state"] = dict(kernel_state)
+        planner = getattr(self.arch, "planner", None)
+        if planner and hasattr(planner, "status"):
+            try:
+                state["planner_status"] = planner.status
+            except Exception:  # pragma: no cover
+                state["planner_status"] = None
+        memory = getattr(self.arch, "memory", None)
+        if memory and hasattr(memory, "get_recent_memories"):
+            try:
+                recent = memory.get_recent_memories(n=5)
+                if isinstance(recent, list):
+                    state["recent_memories"] = [
+                        item for item in recent if isinstance(item, Mapping)
+                    ][:5]
+            except Exception:  # pragma: no cover
+                state["recent_memories"] = []
+        homeo = getattr(self.arch, "homeostasis", None) or getattr(
+            self.arch, "homeo", None
+        )
+        if homeo and hasattr(homeo, "status_snapshot"):
+            try:
+                snapshot = homeo.status_snapshot()
+                if isinstance(snapshot, Mapping):
+                    state["homeostasis"] = dict(snapshot)
+            except Exception:  # pragma: no cover
+                state["homeostasis"] = None
+        return state
+
+    def _call_llm(
+        self,
+        goal: Mapping[str, Any],
+        proposals: List[Mapping[str, Any]],
+        arch_state: Mapping[str, Any],
+        *,
+        idle_for: Optional[float],
+    ) -> AutonomyLLMOutcome:
+        payload = {
+            "goal": dict(goal),
+            "proposals": list(proposals),
+            "arch_state": dict(arch_state),
+        }
+        if idle_for is not None:
+            payload["idle_seconds"] = float(idle_for)
+
+        manager = self._llm_manager or get_llm_manager()
+        try:
+            response = manager.call_dict(
+                "autonomy_core",
+                input_payload=payload,
+                max_retries=2,
+            )
+        except (LLMUnavailableError, LLMIntegrationError) as exc:
+            raise RuntimeError(f"autonomy_core LLM call failed: {exc}") from exc
+
+        return AutonomyLLMOutcome.from_payload(response, goal_id=goal.get("id", "?"))
+
+    # ------------------------------------------------------------------
+    # Post-processing
+
+    def _apply_metacognition(self, outcome: AutonomyLLMOutcome) -> None:
+        if not outcome.metacognition_event:
+            return
+        metacog = getattr(self.arch, "metacognition", None)
+        if not metacog or not hasattr(metacog, "_record_metacognitive_event"):
+            return
+        event = dict(outcome.metacognition_event)
+        try:  # pragma: no cover - depends on runtime integrations
+            metacog._record_metacognitive_event(**event)
+        except Exception as exc:
+            self.logger.write("autonomy.warn", stage="metacognition", error=str(exc))
+
+    def _apply_policy_feedback(self, outcome: AutonomyLLMOutcome) -> None:
+        policy = getattr(self.arch, "policy", None)
+        if not policy or not hasattr(policy, "register_outcome"):
+            return
+        feedback = outcome.policy_feedback
+        if not feedback:
+            feedback = outcome.decision.get("policy_feedback")
+            if isinstance(feedback, Mapping):
+                feedback = dict(feedback)
+        if not isinstance(feedback, Mapping):
+            return
+        proposal = feedback.get("proposal")
+        success = bool(feedback.get("success", False))
+        try:  # pragma: no cover - depends on runtime integrations
+            policy.register_outcome(proposal, success)
         except Exception as exc:
             self.logger.write("autonomy.warn", stage="policy_feedback", error=str(exc))
 
-        progress_delta = max(0.0, progress_after - progress)
-        reward_signal = min(1.0, 0.4 * evi + 5.0 * progress_delta)
-        kernel_state = getattr(self.arch, "phenomenal_kernel_state", None)
-        hedonic_reward = 0.0
-        mode = "travail"
-        if isinstance(kernel_state, dict):
-            try:
-                hedonic_reward = float(kernel_state.get("hedonic_reward", 0.0))
-            except Exception:
-                hedonic_reward = 0.0
-            mode = kernel_state.get("mode") or kernel_state.get("mode_suggestion") or "travail"
-        if hedonic_reward:
-            blend = 0.5 if mode == "flanerie" else 0.2
-            hedonic_scaled = max(0.0, min(1.0, 0.5 + 0.5 * hedonic_reward))
-            reward_signal = max(0.0, min(1.0, (1.0 - blend) * reward_signal + blend * hedonic_scaled))
-        if isinstance(decision, dict) and decision.get("decision") == "apply":
-            reward_signal = min(
-                1.0,
-                reward_signal + 0.3 * float(decision.get("confidence", 0.5)),
-            )
-        self._update_policy_weights(features, reward_signal)
-        self._adaptive_ema_feedback("belief", reward_signal)
-        self._adaptive_ema_feedback("novelty", reward_signal)
-        self._adaptive_ema_feedback("progress", reward_signal)
-
-    def _distill_micro_rule(self, goal_id: str) -> str:
-        """
-        Distille une mini-règle depuis l'historique récent pour garder l'agent 'vivant'.
-        (Heuristique très simple et sûre.)
-        """
-        try:
-            # lit les 30 derniers événements dialogue/autonomy (si dispo via logger → non trivial)
-            # ici : renvoie une règle statique contextualisée pour démarrer
-            if goal_id == "understand_humans":
-                return "Toujours expliciter l'hypothèse et demander 1 validation binaire."
-            if goal_id == "self_modeling":
-                return "Journaliser 'ce que j'ai appris' au moins une fois par tour."
-            if goal_id == "tooling_mastery":
-                return "Proposer un patch minimal plutôt qu'un grand refactor."
-            return "Faire un pas plus petit mais mesurable."
-        except Exception:
-            return "Faire un pas plus petit mais mesurable."
-
-    def _compute_features(
-        self,
-        progress: float,
-        belief: float,
-        novelty: float,
-        evi: float,
-    ) -> Dict[str, float]:
-        return {
-            "bias": 1.0,
-            "progress": progress,
-            "progress_sq": progress * progress,
-            "belief": belief,
-            "belief_sq": belief * belief,
-            "novelty": novelty,
-            "novelty_sq": novelty * novelty,
-            "evi": evi,
-            "evi_progress": evi * progress,
-        }
-
-    def _sigmoid(self, value: float) -> float:
-        if value < -60:
-            return 0.0
-        if value > 60:
-            return 1.0
-        return 1.0 / (1.0 + math.exp(-value))
-
-    def _linear_score(self, features: Dict[str, float]) -> float:
-        score = 0.0
-        for key, val in features.items():
-            weight = self._policy_weights.get(key, 0.0)
-            score += weight * val
-        return score
-
-    def _update_policy_weights(self, features: Dict[str, float], reward: float) -> None:
-        reward = max(0.0, min(1.0, reward))
-        prediction = self._sigmoid(self._linear_score(features))
-        error = reward - prediction
-        gradient_scale = prediction * (1 - prediction)
-        drift_detected = False
-        for key, value in features.items():
-            grad = error * gradient_scale * value
-            grad = max(-self._max_step, min(self._max_step, grad))
-            update = self._learning_rate * grad
-            if abs(update) < 1e-5:
-                continue
-            new_weight = self._policy_weights.get(key, 0.0) + update
-            if abs(new_weight - self._last_weight_snapshot.get(key, new_weight)) >= self._weight_drift_threshold:
-                drift_detected = True
-            self._policy_weights[key] = new_weight
-        if drift_detected:
-            self.logger.write(
-                "autonomy.drift",
-                weights=self._policy_weights,
-                reward=reward,
-                prediction=prediction,
-            )
-            self._last_weight_snapshot = dict(self._policy_weights)
-
-    def _init_ema_tracker(self) -> Dict[str, Any]:
-        return {
-            "states": {
-                beta: {"value": None, "alpha": 1.0, "beta": 1.0}
-                for beta in self._ema_betas
-            },
-            "last_choice": None,
-        }
-
-    def _adaptive_ema_step(self, key: str, new_value: float) -> float:
-        tracker = self._ema_trackers[key]
-        best_beta = None
-        best_sample = None
-        for beta, params in tracker["states"].items():
-            alpha = max(1e-3, params["alpha"])
-            beta_param = max(1e-3, params["beta"])
-            # Thompson sampling: draw a Beta sample; fallback to posterior mean if random fails.
-            try:
-                sample = random.betavariate(alpha, beta_param)
-            except Exception:
-                sample = alpha / (alpha + beta_param)
-            if best_sample is None or sample > best_sample:
-                best_sample = sample
-                best_beta = beta
-        if best_beta is None:
-            best_beta = self._ema_betas[0]
-        tracker["last_choice"] = best_beta
-        state = tracker["states"][best_beta]
-        prev = state["value"]
-        if prev is None:
-            state["value"] = new_value
-        else:
-            state["value"] = (1 - best_beta) * prev + best_beta * new_value
-        return float(state["value"])
-
-    def _adaptive_ema_feedback(self, key: str, reward: float) -> None:
-        tracker = self._ema_trackers[key]
-        chosen_beta = tracker.get("last_choice")
-        if chosen_beta is None:
-            return
-        params = tracker["states"][chosen_beta]
-        if reward >= 0.5:
-            params["alpha"] += 1.0
-        else:
-            params["beta"] += 1.0
-
-    def _query_llm_guidance(
-        self,
-        *,
-        goal_id: str,
-        features: Dict[str, float],
-        belief: float,
-        novelty: float,
-        progress: float,
-        evi: float,
-        proposals: List[Dict[str, Any]],
-    ) -> Optional[Mapping[str, Any]]:
-        payload = {
-            "goal_id": goal_id,
-            "features": features,
-            "belief": belief,
-            "novelty": novelty,
-            "progress": progress,
-            "evi": evi,
-            "proposals": proposals,
-        }
-
-        response = try_call_llm_dict(
-            "autonomy_core",
-            input_payload=payload,
-            logger=LOGGER,
-        )
-
-        if isinstance(response, Mapping):
-            return dict(response)
-        return None

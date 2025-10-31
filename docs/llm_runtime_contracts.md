@@ -38,6 +38,230 @@ spécifications de prompts et vérifier que les réponses générées restent co
 | `llm_summary` | mapping | Oui (implicite) | Archive brute de la réponse pour audit et instrumentation.【F:AGI_Evolutive/conversation/context.py†L179-L185】 |
 | `llm_topics` | liste de mappings | Non | Préserve le détail structuré (label/rang) fourni par le modèle.【F:AGI_Evolutive/conversation/context.py†L180-L184】 |
 
+## Social
+
+### `social_interaction_context` — `AGI_Evolutive/social/interaction_rule.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `baseline` | mapping | Oui | Sert de fallback local si la réponse LLM est vide (`ContextBuilder.snapshot`).【F:AGI_Evolutive/social/interaction_rule.py†L120-L143】 |
+| `context` | mapping | Oui | Transmis tel quel à `TacticSelector.pick` pour guider la décision de tactique.【F:AGI_Evolutive/social/interaction_rule.py†L104-L143】【F:AGI_Evolutive/social/tactic_selector.py†L24-L47】 |
+| `signals` | mapping | Non | Journalisé avec le contexte pour éclairer la sélection (valence, risque).【F:AGI_Evolutive/social/interaction_rule.py†L126-L143】【F:AGI_Evolutive/social/tactic_selector.py†L31-L47】 |
+| `topics` | liste de `str` | Non | Propagée telle quelle pour enrichir la mémoire et les traces de décision.【F:AGI_Evolutive/social/interaction_rule.py†L132-L143】【F:AGI_Evolutive/language/renderer.py†L513-L546】 |
+| `notes` | `str` | Non | Conserve la justification du modèle pour audit humain.【F:AGI_Evolutive/social/interaction_rule.py†L126-L143】 |
+
+### `social_interaction_miner` — `AGI_Evolutive/social/interaction_miner.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `rules` | liste de mappings | Oui | Chaque élément est converti en :class:`InteractionRule` et stocké dans la mémoire sociale.【F:AGI_Evolutive/social/interaction_miner.py†L40-L89】 |
+| `rules[*].id` | `str` | Oui | Identifiant persistant utilisé pour les mises à jour futures et la planification de validation.【F:AGI_Evolutive/social/interaction_miner.py†L40-L89】【F:AGI_Evolutive/core/document_ingest.py†L324-L361】 |
+| `rules[*].tactic` | mapping | Oui | Reconstruit en :class:`TacticSpec` puis transmis aux sélecteurs et critiques.【F:AGI_Evolutive/social/interaction_rule.py†L61-L101】【F:AGI_Evolutive/social/interaction_miner.py†L40-L89】 |
+| `rules[*].predicates` | liste de mappings | Oui | Normalisées en :class:`Predicate` pour contextualiser l'application de la règle.【F:AGI_Evolutive/social/interaction_rule.py†L45-L83】【F:AGI_Evolutive/social/interaction_miner.py†L40-L89】 |
+| `notes` | `str` | Non | Archivé dans les traces d'induction pour documenter l'analyse du modèle.【F:AGI_Evolutive/social/interaction_miner.py†L60-L89】 |
+
+### `social_rule_self_evaluation` — `AGI_Evolutive/social/interaction_miner.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `actions` | liste de mappings | Oui | Planifiées telles quelles par le job manager pour vérifier la règle récemment extraite.【F:AGI_Evolutive/social/interaction_miner.py†L51-L75】【F:AGI_Evolutive/core/document_ingest.py†L344-L360】 |
+| `actions[*].label` | `str` | Oui | Sert de description dans les jobs planifiés et les journaux de validation.【F:AGI_Evolutive/social/interaction_miner.py†L51-L75】 |
+| `actions[*].priority` | nombre ∈ [0, 1] | Non | Transmis pour ordonner les tâches de validation asynchrones.【F:AGI_Evolutive/social/interaction_miner.py†L51-L75】 |
+| `notes` | `str` | Non | Ajouté aux traces pour contextualiser la recommandation du modèle.【F:AGI_Evolutive/social/interaction_miner.py†L51-L75】 |
+
+### `social_tactic_selector` — `AGI_Evolutive/social/tactic_selector.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `selected_rule` | mapping | Oui | Converti en :class:`InteractionRule` puis persisté/registré comme tactique appliquée.【F:AGI_Evolutive/social/tactic_selector.py†L19-L49】【F:AGI_Evolutive/language/renderer.py†L513-L546】 |
+| `meta.utility` | nombre ∈ [0, 1] | Non | Journalisé pour documenter pourquoi la tactique a été retenue.【F:AGI_Evolutive/social/tactic_selector.py†L33-L47】 |
+| `meta.risk` | nombre ∈ [0, 1] | Non | Transmis dans la trace de décision pour calibrer les garde-fous sociaux.【F:AGI_Evolutive/social/tactic_selector.py†L33-L47】【F:AGI_Evolutive/language/renderer.py†L513-L546】 |
+| `meta.rationale` | `str` | Non | Conserve la justification du modèle pour revue humaine.【F:AGI_Evolutive/social/tactic_selector.py†L33-L47】 |
+
+### `social_adaptive_lexicon` — `AGI_Evolutive/social/adaptive_lexicon.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `matched` | booléen | Oui | Retour immédiat de `AdaptiveLexicon.match` pour indiquer la détection d’un marqueur.【F:AGI_Evolutive/social/adaptive_lexicon.py†L77-L117】 |
+| `state.tokens` | liste de mappings | Oui | Persiste les entrées actives du lexique dans l’architecture (`_adaptive_lexicon_state`).【F:AGI_Evolutive/social/adaptive_lexicon.py†L37-L74】【F:AGI_Evolutive/social/adaptive_lexicon.py†L94-L110】 |
+| `state.dormant_tokens` | liste de mappings | Non | Permet de conserver les expressions mises en sommeil par le modèle.【F:AGI_Evolutive/social/adaptive_lexicon.py†L37-L74】【F:AGI_Evolutive/social/adaptive_lexicon.py†L94-L110】 |
+| `updates` | liste de mappings | Non | Reflète les renforcements proposés par le modèle (utilisé par les UIs/reporting).【F:AGI_Evolutive/social/adaptive_lexicon.py†L94-L117】 |
+| `notes` | `str` | Non | Consigné dans `last_response` pour faciliter les audits linguistiques.【F:AGI_Evolutive/social/adaptive_lexicon.py†L111-L117】 |
+
+### `social_interaction_outcome` — `AGI_Evolutive/social/social_critic.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `reward` | nombre ∈ [0, 1] | Oui | Clampé et journalisé comme score social final.【F:AGI_Evolutive/social/social_critic.py†L77-L123】【F:AGI_Evolutive/social/social_critic.py†L125-L152】 |
+| `confidence` | nombre ∈ [0, 1] | Oui | Conserve la fiabilité du diagnostic et alimente les rapports métacognitifs.【F:AGI_Evolutive/social/social_critic.py†L77-L142】 |
+| `signals` | mapping | Oui | Diffusé tel quel aux consommateurs (scheduler, monitoring) pour contextualiser l’outcome.【F:AGI_Evolutive/social/social_critic.py†L103-L142】【F:AGI_Evolutive/runtime/scheduler.py†L814-L821】 |
+| `lexicon_updates` | liste de mappings | Non | Remonté aux surfaces produit pour actualiser le vocabulaire préféré.【F:AGI_Evolutive/social/social_critic.py†L103-L142】【F:AGI_Evolutive/language/renderer.py†L351-L359】 |
+| `notes` | `str` | Non | Stocké pour audit dans la mémoire (`social_outcome`).【F:AGI_Evolutive/social/social_critic.py†L125-L152】 |
+
+### `social_conversation_analysis` — `AGI_Evolutive/social/social_critic.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `summary` | `str` | Oui | Fournit une synthèse courte utilisée par les vues d'observation sociale.【F:AGI_Evolutive/social/social_critic.py†L90-L102】 |
+| `risks` / `opportunities` | liste de `str` | Non | Restituées directement pour informer les opérateurs ou déclencher des follow-ups.【F:AGI_Evolutive/social/social_critic.py†L90-L102】 |
+| `recommended_actions` | liste de mappings | Non | Peut être transmis au planner pour instrumentation humaine.【F:AGI_Evolutive/social/social_critic.py†L90-L102】 |
+| `notes` | `str` | Non | Aide-mémoire pour expliquer les observations du modèle.【F:AGI_Evolutive/social/social_critic.py†L90-L102】 |
+
+### `social_conversation_rewrite` — `AGI_Evolutive/social/social_critic.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `rewritten` | `str` | Oui | Remplace le texte initial lorsqu'une reformulation sociale est demandée.【F:AGI_Evolutive/social/social_critic.py†L102-L113】 |
+| `justification` | `str` | Non | Conservée pour expliquer les modifications apportées par le LLM.【F:AGI_Evolutive/social/social_critic.py†L102-L113】 |
+
+### `social_rule_update` — `AGI_Evolutive/social/social_critic.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `rule` | mapping | Oui | Converti en :class:`InteractionRule` puis persisté dans la mémoire sociale.【F:AGI_Evolutive/social/social_critic.py†L113-L152】 |
+| `rule.id` | `str` | Oui | Permet de retrouver et écraser la règle existante correspondante.【F:AGI_Evolutive/social/social_critic.py†L128-L152】 |
+| `notes` | `str` | Non | Stocké aux côtés de la règle pour documenter l'évolution proposée.【F:AGI_Evolutive/social/social_critic.py†L128-L152】 |
+
+### `social_simulation_score` — `AGI_Evolutive/social/social_critic.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `score` | nombre ∈ [0, 1] | Oui | Restitué par `SocialCritic.score` pour comparer scénarios avec/sans mécanisme testé.【F:AGI_Evolutive/social/social_critic.py†L113-L123】【F:AGI_Evolutive/cognition/principle_inducer.py†L662-L663】 |
+| `rationale` | `str` | Non | Conserve l'explication du modèle pour guidage des expérimentations.【F:AGI_Evolutive/social/social_critic.py†L113-L123】 |
+| `signals` | mapping | Non | Permet d'inspecter les métriques clefs dérivées de la simulation.【F:AGI_Evolutive/social/social_critic.py†L113-L123】 |
+
+## Autonomie
+
+### `autonomy_core` — `AGI_Evolutive/autonomy/core.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `hypotheses` | liste de mappings (`content`, `prior`) | Oui | Converties en :class:`Hypothesis`; une hypothèse par défaut est ajoutée si la liste est vide.【F:AGI_Evolutive/autonomy/core.py†L68-L115】【F:AGI_Evolutive/autonomy/core.py†L212-L224】 |
+| `tests` | liste de mappings (`description`, `cost_est`, `expected_information_gain`) | Oui | Transformées en :class:`Test`; une action minimale est générée en fallback.【F:AGI_Evolutive/autonomy/core.py†L118-L146】【F:AGI_Evolutive/autonomy/core.py†L212-L224】 |
+| `evidence` | mapping (`notes`, `confidence`) | Oui | Normalisée en :class:`Evidence` injectée dans `episode_record`.【F:AGI_Evolutive/autonomy/core.py†L149-L158】【F:AGI_Evolutive/autonomy/core.py†L217-L228】 |
+| `decision` | mapping | Oui | Archivée dans les journaux et sert de source de feedback éventuel vers la policy.【F:AGI_Evolutive/autonomy/core.py†L212-L226】【F:AGI_Evolutive/autonomy/core.py†L301-L324】 |
+| `progress_step` | nombre ∈ [0, 1] | Oui | Transmis à `GoalDAG.bump_progress` pour incrémenter l’objectif courant.【F:AGI_Evolutive/autonomy/core.py†L200-L209】【F:AGI_Evolutive/autonomy/core.py†L239-L247】 |
+| `final_confidence` | nombre ∈ [0, 1] | Non | Renseigne `final_confidence` dans `episode_record`; défaut sur la confiance de la preuve.【F:AGI_Evolutive/autonomy/core.py†L173-L187】【F:AGI_Evolutive/autonomy/core.py†L212-L224】 |
+| `result_text` | `str` | Non | Texte résumé injecté dans l’épisode pour audit.【F:AGI_Evolutive/autonomy/core.py†L177-L186】【F:AGI_Evolutive/autonomy/core.py†L212-L224】 |
+| `metacognition_event` | mapping | Non | Relayé à `metacognition._record_metacognitive_event` si disponible.【F:AGI_Evolutive/autonomy/core.py†L189-L208】【F:AGI_Evolutive/autonomy/core.py†L264-L276】 |
+| `policy_feedback` | mapping | Non | Transmis à `policy.register_outcome` pour informer la boucle legacy.【F:AGI_Evolutive/autonomy/core.py†L189-L208】【F:AGI_Evolutive/autonomy/core.py†L278-L324】 |
+| `annotations` | mapping | Non | Ajouté tel quel dans `autonomy.tick` pour instrumentation et audit.【F:AGI_Evolutive/autonomy/core.py†L189-L208】【F:AGI_Evolutive/autonomy/core.py†L212-L226】 |
+
+### `auto_evolution` — `AGI_Evolutive/autonomy/auto_evolution.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `accepted` | booléen | Oui | Détermine si l’intention proposée doit être promue immédiatement.【F:AGI_Evolutive/autonomy/auto_evolution.py†L78-L128】【F:AGI_Evolutive/autonomy/auto_evolution.py†L170-L214】 |
+| `intention` | mapping | Oui | Recopié dans `AutoEvolutionOutcome.intention` et transmis au registre de signaux (action_type/description).【F:AGI_Evolutive/autonomy/auto_evolution.py†L82-L131】【F:AGI_Evolutive/autonomy/auto_evolution.py†L212-L221】 |
+| `intention.action_type` | `str` | Oui | Sert de clé pour enregistrer les signaux dérivés via `AutoSignalRegistry.register`.【F:AGI_Evolutive/autonomy/auto_evolution.py†L214-L221】 |
+| `intention.description` | `str` | Non | Journalisé tel quel pour contextualiser la décision automatique.【F:AGI_Evolutive/autonomy/auto_evolution.py†L214-L221】 |
+| `intention.confidence` | nombre ∈ [0, 1] | Non | Utilisé pour calibrer la confiance globale associée à l'intention proposée.【F:AGI_Evolutive/autonomy/auto_evolution.py†L78-L128】 |
+| `evaluation` | mapping | Oui | Normalisé et utilisé pour contextualiser les signaux enregistrés par le LLM.【F:AGI_Evolutive/autonomy/auto_evolution.py†L83-L132】【F:AGI_Evolutive/autonomy/auto_evolution.py†L214-L221】 |
+| `evaluation.score` / `impact` | nombre ou `str` | Non | Instrumentés dans les logs pour suivre la sévérité ou l'effet attendu de l'intention.【F:AGI_Evolutive/autonomy/auto_evolution.py†L78-L133】 |
+| `signals` | liste de mappings | Non | Chaque élément est renvoyé au `AutoSignalRegistry` via `register` pour être persisté et suivi.【F:AGI_Evolutive/autonomy/auto_evolution.py†L84-L133】【F:AGI_Evolutive/autonomy/auto_evolution.py†L206-L223】 |
+| `signals[*].metric` | `str` | Oui | Sert de clé principale pour dédupliquer/mettre à jour le signal existant.【F:AGI_Evolutive/autonomy/auto_signals.py†L40-L88】 |
+| `signals[*].direction` | `str` (`above`/`below`) | Non | Détermine la polarité lors de la conversion en :class:`AutoSignal`.【F:AGI_Evolutive/autonomy/auto_signals.py†L53-L88】 |
+| `signals[*].target` | nombre | Non | Stocké dans `AutoSignal.target` pour guider l'objectif numérique.【F:AGI_Evolutive/autonomy/auto_signals.py†L53-L88】 |
+| `signals[*].weight` | nombre | Non | Transmis à `AutoSignal.weight` pour pondérer les observations futures.【F:AGI_Evolutive/autonomy/auto_signals.py†L53-L88】 |
+| `follow_up` | liste de `str` | Non | Conserve les actions de suivi recommandées par le modèle (stockées dans `AutoEvolutionOutcome.follow_up`).【F:AGI_Evolutive/autonomy/auto_evolution.py†L85-L117】【F:AGI_Evolutive/autonomy/auto_evolution.py†L134-L141】 |
+| `metadata` | mapping | Non | Archivé tel quel dans l’issue LLM pour instrumentation et audit ultérieur.【F:AGI_Evolutive/autonomy/auto_evolution.py†L86-L118】【F:AGI_Evolutive/autonomy/auto_evolution.py†L117-L128】 |
+
+## Croyances
+
+### `belief_graph_orchestrator` — `AGI_Evolutive/beliefs/graph.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `result.operation` | `str` | Non | Journalisé pour instrumentation lors des retours LLM.【F:AGI_Evolutive/beliefs/graph.py†L310-L330】 |
+| `result.belief_id` | `str` | Oui (opérations `upsert_belief` / `add_evidence`) | Permet de récupérer la croyance normalisée stockée via `_apply_updates`. Absence ⇒ `LLMIntegrationError`.【F:AGI_Evolutive/beliefs/graph.py†L332-L351】 |
+| `result.event_id` | `str` | Oui (opération `add_event`) | Utilisé pour renvoyer l’événement consolidé au runtime après `_apply_updates`.【F:AGI_Evolutive/beliefs/graph.py†L386-L402】 |
+| `updates.beliefs` | liste de mappings | Non | Chaque entrée est convertie en :class:`Belief` et insérée/écrasée dans le cache local.【F:AGI_Evolutive/beliefs/graph.py†L287-L305】 |
+| `updates.events` | liste de mappings | Non | Transformées en :class:`Event` puis persistées dans `_events`.【F:AGI_Evolutive/beliefs/graph.py†L287-L305】 |
+| `updates.remove_beliefs` | liste de `str` | Non | Identifiants supprimés du cache, typiquement lors d’un `retire`.【F:AGI_Evolutive/beliefs/graph.py†L293-L299】 |
+| `updates.remove_events` | liste de `str` | Non | Purge des événements obsolètes du cache local.【F:AGI_Evolutive/beliefs/graph.py†L300-L305】 |
+| `beliefs` | liste de mappings | Non | Retourne les résultats d’une requête structurée (reconvertis en :class:`Belief`).【F:AGI_Evolutive/beliefs/graph.py†L368-L378】 |
+| `pairs` | liste de mappings | Non | Paires `positive`/`negative` identifiant les contradictions à remonter. Les identifiants sont résolus via `_beliefs`.【F:AGI_Evolutive/beliefs/graph.py†L355-L365】 |
+| `notes` | `str` | Non | Stocké pour audit et remonté aux couches appelantes lors des suivis humains.【F:AGI_Evolutive/beliefs/graph.py†L332-L351】【F:AGI_Evolutive/beliefs/graph.py†L377-L381】 |
+
+### `belief_summarizer` — `AGI_Evolutive/beliefs/summarizer.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `narrative` | `str` | Oui | Restituée telle quelle par `latest_summary` pour les tableaux de bord narratifs.【F:AGI_Evolutive/beliefs/summarizer.py†L39-L66】【F:AGI_Evolutive/beliefs/graph.py†L390-L399】 |
+| `anchors` | liste de `str` | Non | Dénote les points d’ancrage principaux diffusés aux modules d’observation.【F:AGI_Evolutive/beliefs/summarizer.py†L45-L64】 |
+| `coherence_score` | nombre ∈ [0, 1] | Non | Sert de métrique de cohérence agrégée dans la télémétrie d’autosurveillance.【F:AGI_Evolutive/beliefs/summarizer.py†L45-L64】 |
+| `notes` | `str` | Non | Ajoutées aux journaux pour documenter recommandations et suivis humains.【F:AGI_Evolutive/beliefs/summarizer.py†L55-L66】 |
+| `raw` | mapping | Non | Conservé pour audit via `BeliefSummarizer.last`.【F:AGI_Evolutive/beliefs/summarizer.py†L22-L63】 |
+
+### `entity_linker` — `AGI_Evolutive/beliefs/entity_linker.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `entity.canonical_id` | `str` non vide | Oui | Clé principale stockée dans `_entities` et retournée aux consommateurs.【F:AGI_Evolutive/beliefs/entity_linker.py†L54-L105】【F:AGI_Evolutive/beliefs/entity_linker.py†L140-L187】 |
+| `entity.entity_type` | `str` | Oui | Renseigne le type final retourné par `resolve`/`link`.【F:AGI_Evolutive/beliefs/entity_linker.py†L56-L187】 |
+| `entity.confidence` | nombre ∈ [0, 1] | Non | Persiste le niveau de confiance pour instrumentation et merges futurs.【F:AGI_Evolutive/beliefs/entity_linker.py†L56-L110】 |
+| `entity.justification` | `str` | Non | Journalisé dans `EntityEntry.raw` pour audit manuel.【F:AGI_Evolutive/beliefs/entity_linker.py†L87-L110】 |
+| `entity.aliases` | liste de `str` | Non | Chaque alias est normalisé et indexé dans `_aliases`.【F:AGI_Evolutive/beliefs/entity_linker.py†L105-L122】 |
+| `aliases` | liste de `str` | Non | Ajoutées comme alias secondaires après résolution ou merge.【F:AGI_Evolutive/beliefs/entity_linker.py†L110-L122】【F:AGI_Evolutive/beliefs/entity_linker.py†L205-L220】 |
+| `notes` | `str` | Non | Renvoyées telles quelles à l’appelant (notes opérateur).【F:AGI_Evolutive/beliefs/entity_linker.py†L171-L181】 |
+
+### `ontology_enrichment` — `AGI_Evolutive/beliefs/ontology.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `entities` | liste de mappings | Non | Chaque entrée est convertie en :class:`EntityType` puis enregistrée.【F:AGI_Evolutive/beliefs/ontology.py†L79-L126】【F:AGI_Evolutive/beliefs/ontology.py†L153-L177】 |
+| `entities[*].parent` | `str` | Non | Définit l’ancrage hiérarchique lors de l’enregistrement.【F:AGI_Evolutive/beliefs/ontology.py†L99-L126】 |
+| `relations` | liste de mappings | Non | Chaque mapping alimente :class:`RelationType` (domain/range/polarity).【F:AGI_Evolutive/beliefs/ontology.py†L128-L177】 |
+| `events` | liste de mappings | Non | Converties en :class:`EventType` pour la gestion des rôles n-aires.【F:AGI_Evolutive/beliefs/ontology.py†L178-L214】 |
+| `notes` | `str` | Non | Peut justifier l’absence de suggestion fiable ; conservé tel quel pour audit.【F:AGI_Evolutive/beliefs/ontology.py†L120-L177】 |
+
+### `auto_signal_derivation` — `AGI_Evolutive/autonomy/auto_signals.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `signals` | liste de mappings | Oui | Chaque définition est renvoyée par `AutoSignalRegistry.derive` pour alimenter la promotion d’intentions (avant enregistrement).【F:AGI_Evolutive/autonomy/auto_signals.py†L103-L150】【F:AGI_Evolutive/autonomy/auto_signals.py†L183-L208】 |
+| `signals[*].name` | `str` | Non | Sert d'alias lisible pour les journaux et UIs d'autonomie.【F:AGI_Evolutive/autonomy/auto_signals.py†L53-L88】 |
+| `signals[*].metric` | `str` | Oui | Normalisé via `_ensure_metric` pour garantir une clé persistante côté registre.【F:AGI_Evolutive/autonomy/auto_signals.py†L40-L88】 |
+| `signals[*].direction` | `str` (`above`/`below`) | Non | Détermine l'interprétation des futures observations (favoriser ou réduire la valeur).【F:AGI_Evolutive/autonomy/auto_signals.py†L53-L88】 |
+| `signals[*].target` | nombre | Non | Guide la valeur attendue ; clampé à float si présent.【F:AGI_Evolutive/autonomy/auto_signals.py†L53-L88】 |
+| `signals[*].weight` | nombre | Non | Pondération utilisée lors du calcul des récompenses. Clampée si fournie.【F:AGI_Evolutive/autonomy/auto_signals.py†L53-L88】 |
+| `signals[*].source` | `str` | Non | Conserve l'origine (llm_derivation, historique, etc.) pour l'audit.【F:AGI_Evolutive/autonomy/auto_signals.py†L53-L88】 |
+| `signals[*].metadata` | mapping | Non | Recopiée telle quelle pour contextualiser les calculs (fenêtre, agrégation).【F:AGI_Evolutive/autonomy/auto_signals.py†L53-L88】 |
+
+### `auto_signal_registration` — `AGI_Evolutive/autonomy/auto_signals.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `signals` | liste de mappings | Oui | Converties en :class:`AutoSignal` et stockées dans le registre avec leurs observations initiales.【F:AGI_Evolutive/autonomy/auto_signals.py†L153-L236】【F:AGI_Evolutive/autonomy/auto_signals.py†L212-L236】 |
+| `signals[*].metadata` | mapping | Non | Stockée dans `AutoSignal.metadata` pour décrire la méthode de mesure (fenêtre, agrégat).【F:AGI_Evolutive/autonomy/auto_signals.py†L53-L88】【F:AGI_Evolutive/autonomy/auto_signals.py†L212-L223】 |
+| `signals[*].last_value` | nombre | Non | Initialise `AutoSignal.last_value` pour guider immédiatement la mise en forme des récompenses.【F:AGI_Evolutive/autonomy/auto_signals.py†L212-L231】 |
+| `signals[*].last_source` | `str` | Non | Conserve l’origine de l’observation (`llm`, `baseline`, etc.) dans la trace locale.【F:AGI_Evolutive/autonomy/auto_signals.py†L212-L233】 |
+| `signals[*].last_updated` | timestamp float | Non | Par défaut à `time.time()` si absent ; permet de dater la dernière observation connue.【F:AGI_Evolutive/autonomy/auto_signals.py†L212-L231】 |
+
+### `auto_signal_keywords` — `AGI_Evolutive/autonomy/auto_signals.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `keywords` | liste de `str` | Oui | Restituée telle quelle par `extract_keywords` pour fournir des indices aux modules amont (UI, intentions).【F:AGI_Evolutive/autonomy/auto_signals.py†L238-L258】 |
+| `confidence` | nombre ∈ [0, 1] | Non | Propagé pour indiquer la fiabilité de l'extraction automatique.【F:AGI_Evolutive/autonomy/auto_signals.py†L238-L258】 |
+| `notes` | `str` | Non | Conservé dans les journaux pour contextualiser l'extraction (ambiguïtés, risques).【F:AGI_Evolutive/autonomy/auto_signals.py†L238-L258】 |
+
+## Auto-amélioration
+
+### `code_evolver` — `AGI_Evolutive/self_improver/code_evolver.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `summary` | `str` | Non | Journalisé pour contextualiser le lot de patches proposé.【F:AGI_Evolutive/self_improver/code_evolver.py†L214-L238】 |
+| `patches` | liste de mappings | Oui | Chaque entrée est transformée en :class:`CodePatch` puis évaluée côté Python.【F:AGI_Evolutive/self_improver/code_evolver.py†L240-L276】【F:AGI_Evolutive/self_improver/code_evolver.py†L280-L300】 |
+| `patches[*].target_id` | `str` | Oui | Permet d’associer la proposition à un fichier/module connu ; défaut sur la première cible valide.【F:AGI_Evolutive/self_improver/code_evolver.py†L252-L272】 |
+| `patches[*].patched_source` | `str` non vide | Oui | Écrase directement la source locale lors de la promotion du patch.【F:AGI_Evolutive/self_improver/code_evolver.py†L92-L136】【F:AGI_Evolutive/self_improver/code_evolver.py†L308-L325】 |
+| `patches[*].assessment.should_promote` | booléen | Oui | Conditionne la valeur `passed` utilisée par `SelfImprover.run_code_cycle` pour enregistrer un candidat.【F:AGI_Evolutive/self_improver/code_evolver.py†L121-L133】【F:AGI_Evolutive/self_improver/__init__.py†L153-L198】 |
+| `patches[*].assessment.confidence` | nombre ∈ [0, 1] | Non | Propagé dans les logs et la mémoire pour suivre la confiance du modèle.【F:AGI_Evolutive/self_improver/code_evolver.py†L102-L133】【F:AGI_Evolutive/self_improver/__init__.py†L162-L198】 |
+| `patches[*].evaluation.expected_metrics` | mapping | Non | Utilisé tel quel comme métriques projetées pour le staging de promotion.【F:AGI_Evolutive/self_improver/code_evolver.py†L137-L157】【F:AGI_Evolutive/self_improver/__init__.py†L166-L190】 |
+| `patches[*].evaluation.quality` / `canary` | mapping | Non | Archivé dans les métadonnées du candidat afin de conserver le diagnostic LLM.【F:AGI_Evolutive/self_improver/code_evolver.py†L137-L157】【F:AGI_Evolutive/self_improver/__init__.py†L180-L194】 |
+| `patches[*].notes` | `str` | Non | Propagée dans l’historique et la mémoire pour informer les opérateurs humains.【F:AGI_Evolutive/self_improver/code_evolver.py†L137-L157】【F:AGI_Evolutive/self_improver/__init__.py†L162-L198】 |
+
 ## Raisonnement
 
 ### `reasoning_episode` — `AGI_Evolutive/reasoning/__init__.py`
@@ -397,3 +621,191 @@ payload d’entrée.
 un sous-ensemble JSON.
 - Les champs indiqués « obligatoires » peuvent désactiver tout le bénéfice de l’appel si absents :
 un test rapide via mocks LLM permet de s’en assurer avant déploiement.
+
+## Learning
+
+### `experiential_learning_cycle` — `AGI_Evolutive/learning/__init__.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `summary` | `str` | Oui | Journalise la synthèse de l’épisode dans l’historique interne du module.【F:AGI_Evolutive/learning/__init__.py†L87-L114】 |
+| `confidence` | `float` ∈ [0, 1] | Oui | Sert de métrique principale pour le suivi méta-apprentissage.【F:AGI_Evolutive/learning/__init__.py†L87-L114】 |
+| `actions` | liste d’objets | Non | Injectées telles quelles dans `LearningEpisodeOutcome.actions` pour orchestration future.【F:AGI_Evolutive/learning/__init__.py†L96-L110】 |
+| `memory_updates` | liste d’objets | Non | Chaque élément est transmis aux stores mémoire via la couche appelante.【F:AGI_Evolutive/learning/__init__.py†L111-L114】 |
+| `metrics` | `dict` | Non | Agrégées pour la persistance dans `to_state()`.【F:AGI_Evolutive/learning/__init__.py†L115-L118】 |
+| `notes` | liste de `str` | Non | Ajoutées aux traces diagnostiques ; aucune interprétation automatique.【F:AGI_Evolutive/learning/__init__.py†L119-L122】 |
+
+### `learning_self_assessment` — `AGI_Evolutive/learning/__init__.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `concept` | `str` | Non | Recopié pour audit ; le module conserve la valeur initiale si absent.【F:AGI_Evolutive/learning/__init__.py†L150-L170】 |
+| `confidence` | `float` ∈ [0, 1] | Oui | Valeur renvoyée directement aux gardes qualité pour la promotion auto.【F:AGI_Evolutive/learning/__init__.py†L164-L170】 |
+| `coverage` | `dict` (`definition`/`examples`/`counterexample`) | Non | Stocké pour inspection et indicateurs méta.【F:AGI_Evolutive/learning/__init__.py†L164-L170】 |
+| `evidence` | liste de `str` | Non | Conservée dans `last_self_assessment` pour faciliter les vérifications humaines.【F:AGI_Evolutive/learning/__init__.py†L164-L170】 |
+| `notes` | liste de `str` | Non | Ajoutées à l’historique des décisions.【F:AGI_Evolutive/learning/__init__.py†L164-L170】 |
+
+### `learning_auto_curriculum` — `AGI_Evolutive/learning/__init__.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `curriculum_entry` | `dict` | Oui | Consigné dans `_curriculum_log` et utilisé pour guider les auto-évolutions futures.【F:AGI_Evolutive/learning/__init__.py†L172-L191】 |
+| `adjustments` | `dict` | Non | Valeurs appliquées côté appelant (ex. mise à jour de momentum).【F:AGI_Evolutive/learning/__init__.py†L182-L191】 |
+| `notes` | liste de `str` | Non | Journalisées pour audit humain.【F:AGI_Evolutive/learning/__init__.py†L184-L191】 |
+
+### `learning_meta_controller` — `AGI_Evolutive/learning/__init__.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `module` | `str` | Oui | Identifie le module concerné par le feedback ; conservé dans `_feedback_log`.【F:AGI_Evolutive/learning/__init__.py†L210-L236】 |
+| `adjustments` | `dict` | Oui | Objet principal appliqué par les couches supérieures (ex. nouveau learning rate).【F:AGI_Evolutive/learning/__init__.py†L222-L236】 |
+| `alerts` | liste de `str` | Non | Déclenchent des notifications méta si présentes.【F:AGI_Evolutive/learning/__init__.py†L225-L236】 |
+| `notes` | liste de `str` | Non | Ajoutées à l’historique pour expliquer les choix.【F:AGI_Evolutive/learning/__init__.py†L232-L236】 |
+
+### `learning_curriculum_planner` — `AGI_Evolutive/learning/__init__.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `focus_modules` | liste de `str` | Oui | Ordonne les priorités transmises au scheduling d’apprentissage.【F:AGI_Evolutive/learning/__init__.py†L238-L262】 |
+| `recommendations` | liste d’objets | Non | Chaque recommandation est loggée pour suivi ; libre d’interprétation côté opérateur.【F:AGI_Evolutive/learning/__init__.py†L244-L262】 |
+| `review_after` | `int` (minutes) | Non | Sert de suggestion pour replanifier le curriculum.【F:AGI_Evolutive/learning/__init__.py†L248-L262】 |
+| `notes` | liste de `str` | Non | Trace textuelle du raisonnement du modèle.【F:AGI_Evolutive/learning/__init__.py†L244-L262】 |
+
+### `learning_transfer_mapping` — `AGI_Evolutive/learning/__init__.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `summary` | `str` | Oui | Ajouté dans `_transfer_log` pour audit des transferts.【F:AGI_Evolutive/learning/__init__.py†L282-L312】 |
+| `transferred_items` | liste de `str` | Non | Documente les éléments réellement migrés.【F:AGI_Evolutive/learning/__init__.py†L286-L312】 |
+| `difficulties` | liste de `str` | Non | Aide à cibler les lacunes lors du prochain cycle.【F:AGI_Evolutive/learning/__init__.py†L286-L312】 |
+| `success_score` | `float` ∈ [0, 1] | Oui | Base pour les métriques méta et l’acceptation du transfert.【F:AGI_Evolutive/learning/__init__.py†L288-L312】 |
+| `updated_target` | `dict` | Non | Si présent, remplace l’état local du domaine cible.【F:AGI_Evolutive/learning/__init__.py†L293-L312】 |
+| `notes` | liste de `str` | Non | Conservées dans le log pour compréhension future.【F:AGI_Evolutive/learning/__init__.py†L286-L312】 |
+
+### `learning_reinforcement_policy` — `AGI_Evolutive/learning/__init__.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `action` | `str` | Oui | Action exécutée ou utilisée comme fallback si la liste d’entrée était vide.【F:AGI_Evolutive/learning/__init__.py†L330-L362】 |
+| `estimated_value` | `float` | Oui | Restitué par `update_value` pour compatibilité avec l’API héritée.【F:AGI_Evolutive/learning/__init__.py†L354-L362】 |
+| `confidence` | `float` ∈ [0, 1] | Non | Permet d’arbitrer avec d’autres politiques si nécessaire.【F:AGI_Evolutive/learning/__init__.py†L343-L352】 |
+| `policy_notes` | liste de `str` | Non | Journalisées dans `_policy_log` pour inspection.【F:AGI_Evolutive/learning/__init__.py†L343-L352】 |
+
+### `learning_curiosity_update` — `AGI_Evolutive/learning/__init__.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `reward` | `float` ∈ [-1, 1] | Oui | Valeur de retour directe de `CuriosityEngine.stimulate`.【F:AGI_Evolutive/learning/__init__.py†L364-L399】 |
+| `curiosity_level` | `float` ∈ [0, 1] | Oui | Met à jour le niveau interne pour les appels futurs.【F:AGI_Evolutive/learning/__init__.py†L390-L399】 |
+| `signals` | liste de `str` | Non | Permet d’informer les autres systèmes (motivation, métacognition).【F:AGI_Evolutive/learning/__init__.py†L384-L399】 |
+| `notes` | liste de `str` | Non | Trace les heuristiques ou doutes du modèle.【F:AGI_Evolutive/learning/__init__.py†L384-L399】 |
+
+## Runtime
+
+### `jsonl_logger` — `AGI_Evolutive/runtime/logger.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `summary` | `str` | Non | Journalisé dans `llm_analysis.summary` pour contextualiser chaque événement.【F:AGI_Evolutive/runtime/logger.py†L37-L55】 |
+| `tags` | liste de `str` | Non | Fusionnés avec `extra_tags` puis persistés dans l'enregistrement JSONL.【F:AGI_Evolutive/runtime/logger.py†L37-L55】 |
+| `priority` | `str` | Non | Injecté dans `llm_analysis` afin de pondérer la télémétrie et les alertes.【F:AGI_Evolutive/runtime/logger.py†L37-L55】 |
+| `notes` | `str` | Non | Ajouté à l'analyse LLM pour expliquer l'événement archivé.【F:AGI_Evolutive/runtime/logger.py†L37-L55】 |
+
+### `runtime_analytics` — `AGI_Evolutive/runtime/analytics.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `summary` | `str` | Non | Stocké dans `last_output` et écrit dans le journal JSONL pour audit.【F:AGI_Evolutive/runtime/analytics.py†L67-L119】 |
+| `alerts` | liste de mappings | Non | Ajoutées à l'analyse persistée pour suivre les risques signalés.【F:AGI_Evolutive/runtime/analytics.py†L84-L119】 |
+| `recommendations` | liste de `str` | Non | Restituées dans l'analyse LLM et transmises aux opérateurs.【F:AGI_Evolutive/runtime/analytics.py†L84-L119】 |
+
+### `runtime_job_manager` — `AGI_Evolutive/runtime/job_manager.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `prioritized_jobs` | liste de mappings | Oui | Le premier `job_id` valide déclenche l'exécution, sinon le job est marqué `llm_missing_selection`.【F:AGI_Evolutive/runtime/job_manager.py†L219-L276】 |
+| `prioritized_jobs[*].job_id` | `str` | Oui | Identifiant appliqué pour passer le job en état `running`.【F:AGI_Evolutive/runtime/job_manager.py†L233-L248】 |
+| `prioritized_jobs[*].rationale` | `str` | Non | Recopié dans `job.llm_notes` et journalisé dans l'historique.【F:AGI_Evolutive/runtime/job_manager.py†L244-L276】 |
+| `notes` | `str` | Non | Conservé dans `history` pour éclairer les décisions futures.【F:AGI_Evolutive/runtime/job_manager.py†L269-L276】 |
+
+### `scheduler` — `AGI_Evolutive/runtime/scheduler.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `actions` | liste de mappings | Non | Chaque action validée est appliquée via `_resolve_target`; sinon seule la journalisation est effectuée.【F:AGI_Evolutive/runtime/scheduler.py†L59-L157】 |
+| `actions[*].target` | `str` | Non | Objet visé par la méthode d'entretien (`arch`, `jobs`, etc.).【F:AGI_Evolutive/runtime/scheduler.py†L145-L164】 |
+| `actions[*].method` | `str` | Non | Méthode invoquée sur la cible pour réaliser l'ajustement.【F:AGI_Evolutive/runtime/scheduler.py†L145-L155】 |
+| `actions[*].args` | mapping | Non | Paramètres transmis après normalisation JSON.【F:AGI_Evolutive/runtime/scheduler.py†L145-L155】 |
+
+### `system_monitor` — `AGI_Evolutive/runtime/system_monitor.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `observations` | liste de mappings | Non | Intégrées dans `llm_analysis` pour interpréter les mesures collectées.【F:AGI_Evolutive/runtime/system_monitor.py†L34-L137】 |
+| `risks` | liste de `str` | Non | Reprises dans la sortie afin d'alimenter homéostasie et alertes opérateur.【F:AGI_Evolutive/runtime/system_monitor.py†L34-L137】 |
+| `notes` | `str` | Non | Ajouté au commentaire pour documenter les recommandations.【F:AGI_Evolutive/runtime/system_monitor.py†L34-L137】 |
+
+### `phenomenal_kernel` — `AGI_Evolutive/runtime/phenomenal_kernel.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `energy` / `arousal` / `hedonic_reward` | nombre ∈ [0, 1] | Non | Mises à jour dans `state` pour guider les modules émotionnels.【F:AGI_Evolutive/runtime/phenomenal_kernel.py†L90-L125】 |
+| `recommended_mode` | `str` | Non | Propagé dans `state` et exploité par le mode manager.【F:AGI_Evolutive/runtime/phenomenal_kernel.py†L90-L125】 |
+| `justification` | `str` | Non | Conservé dans `state` pour analyser la décision du modèle.【F:AGI_Evolutive/runtime/phenomenal_kernel.py†L90-L125】 |
+
+### `phenomenal_mode_manager` — `AGI_Evolutive/runtime/phenomenal_kernel.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `mode` | `str` (`travail`/`flanerie`) | Oui | Détermine le mode courant et ajuste les budgets de jobs.【F:AGI_Evolutive/runtime/phenomenal_kernel.py†L141-L157】 |
+| `flanerie_ratio` | nombre ∈ [0, 1] | Non | Journalisé dans l'historique pour calibrer les transitions futures.【F:AGI_Evolutive/runtime/phenomenal_kernel.py†L141-L157】 |
+| `flanerie_budget_remaining` | nombre | Non | Sert à calculer le ralentissement appliqué aux files.【F:AGI_Evolutive/orchestrator.py†L2284-L2312】 |
+| `justification` | `str` | Non | Enrichit le log phénoménologique lors du changement de mode.【F:AGI_Evolutive/runtime/phenomenal_kernel.py†L141-L157】 |
+
+### `runtime_dash` — `AGI_Evolutive/runtime/dash.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `daily_summary` | `str` | Non | Restitué dans le rapport pour synthétiser les métriques observées.【F:AGI_Evolutive/runtime/dash.py†L30-L48】 |
+| `recommended_actions` | liste de mappings | Non | Chaque action est conservée dans `report["analysis"]` pour guider les opérateurs.【F:AGI_Evolutive/runtime/dash.py†L30-L48】 |
+| `notes` | `str` | Non | Ajouté au rapport final afin de documenter le contexte du jour.【F:AGI_Evolutive/runtime/dash.py†L30-L48】 |
+
+### `response_formatter` — `AGI_Evolutive/runtime/response.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `message` | `str` | Oui | Réponse finale renvoyée à l'appelant (`humanize_reasoning_block`, `format_agent_reply`).【F:AGI_Evolutive/runtime/response.py†L44-L88】 |
+| `diagnostics.hypothese` | `str` | Non | Conservé dans les diagnostics pour instrumentation UI.【F:AGI_Evolutive/runtime/response.py†L44-L88】 |
+| `diagnostics.incertitude` | nombre ∈ [0, 1] | Non | Met à jour la confiance affichée aux utilisateurs.【F:AGI_Evolutive/runtime/response.py†L44-L88】 |
+| `diagnostics.besoins` / `diagnostics.questions` | liste de `str` | Non | Propagées aux rappels conversationnels et à la télémétrie.【F:AGI_Evolutive/runtime/response.py†L44-L88】 |
+
+### `response_contract` — `AGI_Evolutive/runtime/response.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `hypothese` | `str` | Oui | Devient l'hypothèse de travail dans `last_contract`.【F:AGI_Evolutive/runtime/response.py†L28-L42】 |
+| `incertitude` | nombre ∈ [0, 1] | Oui | Stocké pour guider les reformulations ultérieures.【F:AGI_Evolutive/runtime/response.py†L28-L42】 |
+| `prochain_test` | `str` | Non | Inséré dans les réponses pour cadrer la prochaine étape.【F:AGI_Evolutive/runtime/response.py†L28-L42】 |
+| `appris` | liste de `str` | Non | Documente les apprentissages dans l'état interne.【F:AGI_Evolutive/runtime/response.py†L28-L42】 |
+| `besoins` | liste de `str` | Non | Alimente les sections « besoins » des messages formatés.【F:AGI_Evolutive/runtime/response.py†L28-L42】 |
+
+## Perception
+
+### `perception_module` — `AGI_Evolutive/perception/__init__.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `observations` | liste de mappings | Non | Archivée dans `scene.background["llm_analysis"]` pour audit visuel.【F:AGI_Evolutive/perception/__init__.py†L41-L82】 |
+| `recommended_settings` | mapping | Non | Appliqué à `perceptual_parameters` lorsque les valeurs sont numériques.【F:AGI_Evolutive/perception/__init__.py†L58-L82】 |
+| `notes` | `str` | Non | Stocké dans le résumé LLM pour contextualiser les ajustements.【F:AGI_Evolutive/perception/__init__.py†L58-L82】 |
+
+## World model
+
+### `world_model` — `AGI_Evolutive/world_model/__init__.py`
+
+| Champ | Type attendu | Obligatoire | Effet runtime |
+| --- | --- | --- | --- |
+| `action` | `str` | Non | Recommandation appliquée telle quelle aux consommateurs (scheduler, opérateur).【F:AGI_Evolutive/world_model/__init__.py†L13-L55】 |
+| `scenarios` | mapping | Non | Décrit les scénarios (optimiste/neutre/pessimiste) conservés pour l'analyse d'impact.【F:AGI_Evolutive/world_model/__init__.py†L13-L55】 |
+| `probabilities` | mapping | Non | Sert à calibrer les décisions côté orchestrateur.【F:AGI_Evolutive/world_model/__init__.py†L13-L55】 |
+| `notes` | `str` | Non | Ajouté à l'historique interne pour tracer les explications du modèle.【F:AGI_Evolutive/world_model/__init__.py†L13-L55】 |

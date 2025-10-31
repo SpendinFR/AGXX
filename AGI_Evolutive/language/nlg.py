@@ -1,504 +1,286 @@
+"""LLM-first natural language generation module.
+
+The historical implementation relied on a maze of bandits, EMAs, custom
+lexical heuristics and MAI handlers to gradually massage a base text into the
+final answer.  The refactor collapses all of these micro-steps into a single
+LLM orchestration call that returns the completed message, the sections to
+surface and the moderation/safety annotations.
+
+A light façade (`NLGContext`, `apply_mai_bids_to_nlg`, `paraphrase_light`) is
+kept so the rest of the codebase can progressively migrate without dealing
+with the removed heuristics.  Each helper now delegates to the same structured
+LLM contract and simply exposes the resulting payload.
+"""
+
 from __future__ import annotations
 
-import logging
-import math
-import random
-import re
-import unicodedata
-from collections import defaultdict, deque
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
-from AGI_Evolutive.core.structures.mai import Bid, MAI
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
-
-# --- MAI dispatcher (NLG) ---
-# Registre de handlers extensible à chaud (aucune liste figée)
-_MAI_NLG_HANDLERS: Dict[str, Callable[[Bid, "NLGContext"], None]] = {}
+from AGI_Evolutive.utils.llm_service import LLMIntegrationError, get_llm_manager
 
 
-logger = logging.getLogger(__name__)
+class LanguageGenerationError(RuntimeError):
+    """Raised when the LLM output cannot satisfy the generation contract."""
 
 
-def register_nlg_handler(action_hint: str, fn: Callable[[Bid, "NLGContext"], None]) -> None:
-    """Appelé lors de la promotion d’un MAI si celui-ci fournit un handler dédié."""
-
-    _MAI_NLG_HANDLERS[action_hint] = fn
-
-
-class NLGContext:
-    """Context runtime minimaliste pour appliquer des bids MAI au rendu NLG."""
-
-    def __init__(self, base_text: str, apply_hint: Callable[[str, str], str]):
-        self.text = base_text
-        self._apply_hint = apply_hint
-        self._applied: List[Dict[str, str]] = []
-
-    # --- API utilisée par les handlers ---
-    def mark_applied(self, bid: Bid) -> None:
-        entry = {"origin": bid.source, "hint": bid.action_hint}
-        if entry not in self._applied:
-            self._applied.append(entry)
-
-    def register_custom_action(self, origin: str, hint: str) -> None:
-        entry = {"origin": origin, "hint": hint}
-        if entry not in self._applied:
-            self._applied.append(entry)
-
-    def apply_bid_hint(self, bid: Bid) -> None:
-        hint = (bid.action_hint or "").strip()
-        self.text = self._apply_hint(self.text, hint)
-        self.mark_applied(bid)
-
-    def redact(self, fields: Any, *, bid: Optional[Bid] = None) -> None:
-        if not fields:
-            return
-        if isinstance(fields, (set, list, tuple)):
-            payload = ", ".join(sorted(str(x) for x in fields if x is not None))
-        else:
-            payload = str(fields)
-        note = f"(Je masque {payload} pour protéger la confidentialité.)"
-        current = (self.text or "").strip()
-        if note.lower() not in current.lower():
-            self.text = f"{current}\n\n{note}" if current else note
-        if bid is not None:
-            self.mark_applied(bid)
-
-    def rephrase_politely(self, *, bid: Optional[Bid] = None) -> None:
-        self.text = self._apply_hint(self.text, "RephraseRespectfully")
-        if bid is not None:
-            self.mark_applied(bid)
-
-    def applied_hints(self) -> List[Dict[str, str]]:
-        return list(self._applied)
+def _coerce_string(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
 
 
-def apply_generic(bid: Bid, nlg_context: "NLGContext") -> None:
-    """Fallback générique basé sur le contenu d’un Bid."""
-
-    if isinstance(bid.target, dict) and "redact" in bid.target:
-        nlg_context.redact(bid.target["redact"], bid=bid)
-    elif (bid.action_hint or "").lower().startswith("rephrase"):
-        nlg_context.rephrase_politely(bid=bid)
-    else:
-        nlg_context.apply_bid_hint(bid)
-
-
-def apply_mai_bids_to_nlg(
-    nlg_context: "NLGContext",
-    state: Optional[Dict[str, Any]],
-    predicate_registry: Optional[Dict[str, Any]],
-) -> List[MAI]:
-    from AGI_Evolutive.knowledge.mechanism_store import MechanismStore
-
-    ms = MechanismStore()
-    try:
-        mechanisms: Iterable[MAI] = ms.scan_applicable(state or {}, predicate_registry or {})
-    except Exception:
-        mechanisms = []
-
-    applied: List[MAI] = []
-    for mechanism in mechanisms:
-        applied.append(mechanism)
-        try:
-            bids = mechanism.propose(state or {})
-        except Exception:
-            continue
-        for bid in bids or []:
-            handler = _MAI_NLG_HANDLERS.get(bid.action_hint)
-            if handler:
-                try:
-                    handler(bid, nlg_context)
-                except Exception:
-                    continue
-                nlg_context.mark_applied(bid)
-            else:
-                apply_generic(bid, nlg_context)
-    sections = try_call_llm_dict(
-        "language_nlg",
-        input_payload={
-            "base_text": nlg_context.text,
-            "applied_hints": applied,
-        },
-        logger=logger,
-    )
-    if sections:
-        parts = [sections.get("introduction"), sections.get("body"), sections.get("conclusion")]
-        assembled = "\n\n".join(part.strip() for part in parts if isinstance(part, str) and part.strip())
-        if assembled:
-            nlg_context.text = assembled
-            nlg_context.register_custom_action("llm", "structured_sections")
-            setattr(nlg_context, "llm_sections", dict(sections))
-    return applied
+def _coerce_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    result: List[str] = []
+    if isinstance(value, Iterable):
+        for item in value:
+            if isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    result.append(cleaned)
+    return result
 
 
-ELIDE_MAP = {"le": "l’", "la": "l’", "de": "d’", "que": "qu’"}
+def _coerce_mapping(value: Any) -> Dict[str, Any]:
+    if isinstance(value, Mapping):
+        return {str(key): val for key, val in value.items()}
+    return {}
 
 
-def _starts_vowel(word: str) -> bool:
-    return bool(re.match(r"^[aàâæeéèêëiîïoôœuùûüyh]", (word or "").lower()))
+def _coerce_sections(value: Any) -> List[Dict[str, str]]:
+    sections: List[Dict[str, str]] = []
+    if isinstance(value, Mapping):
+        for key, val in value.items():
+            text = _coerce_string(val)
+            if text:
+                sections.append({"name": str(key), "text": text})
+        return sections
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for item in value:
+            if isinstance(item, Mapping):
+                name = _coerce_string(item.get("name")) or _coerce_string(item.get("title"))
+                text = _coerce_string(item.get("text")) or _coerce_string(item.get("content"))
+                if text:
+                    sections.append({"name": name or "section", "text": text})
+    return sections
 
 
-def elide_token(prev: str, next_word: str) -> str:
-    base = prev.lower()
-    if base in ELIDE_MAP and _starts_vowel(next_word):
-        out = ELIDE_MAP[base]
-        return out if prev.islower() else out.capitalize()
-    return prev
+def _coerce_actions(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
+        return []
+    actions: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            actions.append({str(key): val for key, val in item.items()})
+    return actions
 
 
-def join_tokens(tokens: Iterable[str]) -> str:
-    tokens = list(tokens)
-    if not tokens:
-        return ""
-    out: List[str] = []
-    for idx, token in enumerate(tokens):
-        if idx > 0 and out[-1].lower() in ELIDE_MAP:
-            out[-1] = elide_token(out[-1], token)
-        out.append(token)
-    text = " ".join(out)
-    text = text.replace(" ’", "’").replace(" l’ ", " l’").replace(" d’ ", " d’").replace(" qu’ ", " qu’")
-    text = re.sub(r"\s+([!?;:])", r"\1", text)
-    text = re.sub(r"([!?;:])(?=\S)", r"\1 ", text)
-    return text
-
-
-def _normalize(text: str) -> str:
-    normalized = unicodedata.normalize("NFD", text or "")
-    without_accents = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
-    return without_accents.lower()
-
-
-def _restore_casing(original: str, candidate: str) -> str:
-    if not original:
-        return candidate
-    if original.isupper():
-        return candidate.upper()
-    if original[0].isupper():
-        return candidate[:1].upper() + candidate[1:]
-    return candidate
-
-
-def _strip_punct(token: str) -> Tuple[str, str, str]:
-    prefix = re.match(r"^\W+", token)
-    suffix = re.search(r"\W+$", token)
-    start = prefix.group(0) if prefix else ""
-    end = suffix.group(0) if suffix else ""
-    core = token[len(start) : len(token) - len(end)] if len(token) > len(start) + len(end) else ""
-    return start, core, end
-
-
-def _rebuild_token(prefix: str, replacement: str, suffix: str) -> str:
-    return f"{prefix}{replacement}{suffix}"
-
-
-DEFAULT_PARAPHRASES = {
-    "par defaut": ["d’ordinaire", "en général"],
-    "vraiment": ["franchement", "réellement"],
-    "rapide": ["vite", "prompt"],
-    "simple": ["basique", "élémentaire"],
-    "important": ["clé", "central", "majeur"],
-    "idee": ["intuition", "piste"],
-    "guide": ["fil conducteur", "repère"],
-    "plan": ["feuille de route", "stratégie"],
-    "astuce": ["conseil", "tour de main"],
-    "note": ["remarque", "annotation"],
-    "bien": ["au top", "remarquable"],
-}
-
-
-FALLBACK_PARAPHRASES = {
-    "cool": ["sympa", "amusant"],
-    "ok": ["d’accord", "reçu"],
-}
-
-
-EST_VARIANT_PATTERN = re.compile(
-    r"(?i)est[\s\u00A0]+(?:(?:un|une|le|la|l['’])|des|du|de\s+la)"
-)
+def _assemble_sections(sections: Sequence[Mapping[str, Any]]) -> str:
+    parts: List[str] = []
+    for section in sections:
+        text = _coerce_string(section.get("text"))
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts).strip()
 
 
 @dataclass
-class ThompsonArm:
-    alpha: float = 1.0
-    beta: float = 1.0
+class NLGRequest:
+    """Structured payload forwarded to the LLM generation spec."""
 
-    def sample(self, rng: random.Random) -> float:
-        return rng.betavariate(self.alpha, self.beta)
+    base_text: str
+    surface: Optional[str] = None
+    dialogue: Optional[Mapping[str, Any]] = None
+    reasoning: Optional[Mapping[str, Any]] = None
+    contract: Optional[Mapping[str, Any]] = None
+    style: Optional[Mapping[str, Any]] = None
+    memory: Optional[Mapping[str, Any]] = None
+    hints: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
+    mode: str = "reply"
+    metadata: Optional[Mapping[str, Any]] = None
 
-    def update(self, reward: float) -> None:
-        reward = min(max(reward, 0.0), 1.0)
-        self.alpha += reward
-        self.beta += 1.0 - reward
+    def build_payload(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"base_text": self.base_text, "mode": self.mode}
+        if self.surface:
+            payload["surface"] = self.surface
+        if self.dialogue:
+            payload["dialogue_state"] = _coerce_mapping(self.dialogue)
+        if self.reasoning:
+            payload["reasoning"] = _coerce_mapping(self.reasoning)
+        if self.contract:
+            payload["contract"] = _coerce_mapping(self.contract)
+        if self.style:
+            payload["style_preferences"] = _coerce_mapping(self.style)
+        if self.memory:
+            payload["memory"] = _coerce_mapping(self.memory)
+        if self.hints:
+            payload["applied_actions"] = [dict(item) for item in self.hints]
+        if self.metadata:
+            payload["metadata"] = _coerce_mapping(self.metadata)
+        return payload
 
 
-class BanditExplorer:
-    """Hybrid Thompson Sampling + epsilon-greedy explorer for lexical choices."""
+@dataclass
+class NLGResult:
+    """Normalized representation of the LLM response."""
 
-    def __init__(self, epsilon: float = 0.15, seed: Optional[int] = None):
-        self._epsilon = max(0.0, min(1.0, epsilon))
-        self._rng = random.Random(seed)
-        self._arms: Dict[str, Dict[str, ThompsonArm]] = defaultdict(dict)
+    message: str
+    sections: List[Dict[str, str]] = field(default_factory=list)
+    tone: Optional[str] = None
+    applied_actions: List[Dict[str, Any]] = field(default_factory=list)
+    safety_notes: List[str] = field(default_factory=list)
+    meta: Dict[str, Any] = field(default_factory=dict)
+    raw: MutableMapping[str, Any] = field(default_factory=dict)
 
-    def select(self, key: str, candidates: Sequence[str]) -> Optional[str]:
-        candidates = list(dict.fromkeys(candidates))
-        if not candidates:
-            return None
-        arms = self._arms[key]
-        for candidate in candidates:
-            arms.setdefault(candidate, ThompsonArm())
-        if self._rng.random() < self._epsilon:
-            choice = self._rng.choice(candidates)
-            logger.debug("Exploring randomly for key '%s': %s", key, choice)
-            return choice
-        sampled = {candidate: arms[candidate].sample(self._rng) for candidate in candidates}
-        choice = max(sampled.items(), key=lambda item: item[1])[0]
-        logger.debug("Thompson sampling choice for key '%s': %s", key, choice)
-        return choice
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any], *, fallback_text: str) -> "NLGResult":
+        if not isinstance(payload, Mapping):
+            raise LanguageGenerationError("LLM payload must be a mapping")
 
-    def update(self, key: str, candidate: str, reward: float) -> None:
-        arms = self._arms.get(key)
-        if not arms or candidate not in arms:
-            return
-        logger.debug(
-            "Updating explorer for key '%s' with reward %.3f (candidate=%s)",
-            key,
-            reward,
-            candidate,
+        message = _coerce_string(payload.get("message"))
+        sections = _coerce_sections(payload.get("sections") or payload.get("structured_sections"))
+        if not message:
+            assembled = _assemble_sections(sections)
+            message = assembled or fallback_text.strip()
+        tone = _coerce_string(payload.get("tone"))
+        actions = _coerce_actions(payload.get("applied_actions"))
+        safety_notes = _coerce_string_list(payload.get("safety_notes") or payload.get("alerts"))
+        meta = _coerce_mapping(payload.get("meta"))
+        raw: MutableMapping[str, Any] = dict(payload)
+        if sections and "sections" not in raw:
+            raw["sections"] = [dict(section) for section in sections]
+        return cls(
+            message=message,
+            sections=sections,
+            tone=tone,
+            applied_actions=actions,
+            safety_notes=safety_notes,
+            meta=meta,
+            raw=raw,
         )
-        arms[candidate].update(reward)
-
-    def arm_parameters(self, key: str) -> Dict[str, Tuple[float, float]]:
-        arms = self._arms.get(key, {})
-        return {candidate: (arm.alpha, arm.beta) for candidate, arm in arms.items()}
 
 
-class AdaptiveEMA:
-    """EMA whose smoothing factor is itself selected via Thompson Sampling."""
+class LanguageGeneration:
+    """Thin wrapper around the LLM manager for natural language generation."""
 
-    def __init__(
-        self,
-        betas: Sequence[float] = (0.2, 0.4, 0.6, 0.8),
-        explorer: Optional[BanditExplorer] = None,
-        drift_threshold: float = 0.15,
-    ) -> None:
-        self._betas = tuple(sorted(set(betas)))
-        self._explorer = explorer or BanditExplorer(epsilon=0.0)
-        self._drift_threshold = max(drift_threshold, 0.0)
-        self._values: Dict[float, float] = {}
-        self._history: deque[float] = deque(maxlen=64)
-        self._last_choice: Optional[float] = None
+    def __init__(self, *, llm_manager=None) -> None:
+        self._manager = llm_manager or get_llm_manager()
+        self.last_result: Optional[NLGResult] = None
 
-    def apply(self, value: float) -> float:
-        if not self._betas:
-            return value
-        beta_choice = self._choose_beta()
-        previous = self._values.get(beta_choice)
-        smoothed = value if previous is None else beta_choice * value + (1.0 - beta_choice) * previous
-        self._values[beta_choice] = smoothed
-        self._detect_drift(smoothed)
-        self._history.append(smoothed)
-        self._last_choice = beta_choice
-        return smoothed
-
-    def feedback(self, reward: float) -> None:
-        if self._last_choice is None:
-            return
-        self._explorer.update("__ema__", f"beta={self._last_choice:.1f}", reward)
-
-    def history(self) -> List[float]:
-        return list(self._history)
-
-    def _choose_beta(self) -> float:
-        labels = [f"beta={beta:.1f}" for beta in self._betas]
-        label = self._explorer.select("__ema__", labels)
-        if label is None:
-            return self._betas[0]
+    def generate(self, request: NLGRequest) -> NLGResult:
+        payload = request.build_payload()
         try:
-            return float(label.split("=")[1])
-        except (IndexError, ValueError):
-            return self._betas[0]
-
-    def _detect_drift(self, value: float) -> None:
-        if not self._history:
-            return
-        delta = abs(value - self._history[-1])
-        if delta > self._drift_threshold:
-            logger.info("Qualité : dérive détectée (Δ=%.3f)", delta)
-
-
-class DefaultQualityEvaluator:
-    def score(self, original: str, candidate: str) -> float:
-        if not original and not candidate:
-            return 1.0
-        if not original or not candidate:
-            return 0.0
-        orig_tokens = set(_normalize(original).split()) or {_normalize(original)}
-        cand_tokens = set(_normalize(candidate).split()) or {_normalize(candidate)}
-        intersection = len(orig_tokens & cand_tokens)
-        union = len(orig_tokens | cand_tokens)
-        jaccard = intersection / union if union else 1.0
-        length_ratio = min(len(candidate), len(original)) / max(len(candidate), len(original))
-        punctuation_penalty = 0.0
-        if bool(re.search(r"[!?]{2,}", candidate)) and not re.search(r"[!?]{2,}", original):
-            punctuation_penalty = 0.2
-        score = max(0.0, min(1.0, 0.6 * jaccard + 0.4 * length_ratio - punctuation_penalty))
-        return score
+            response = self._manager.call_dict(
+                "language_nlg",
+                input_payload=payload,
+            )
+        except LLMIntegrationError as exc:
+            raise LanguageGenerationError(str(exc)) from exc
+        if response is None:
+            raise LanguageGenerationError("LLM returned no payload")
+        result = NLGResult.from_payload(response, fallback_text=request.base_text)
+        self.last_result = result
+        return result
 
 
-class QualityTracker:
-    def __init__(
-        self,
-        evaluator: Optional[DefaultQualityEvaluator] = None,
-        ema: Optional[AdaptiveEMA] = None,
-    ) -> None:
-        self._evaluator = evaluator or DefaultQualityEvaluator()
-        self._ema = ema or AdaptiveEMA()
-
-    def observe(self, original: str, candidate: str) -> float:
-        raw_score = self._evaluator.score(original, candidate)
-        smoothed = self._ema.apply(raw_score)
-        self._ema.feedback(raw_score)
-        return smoothed
-
-    def quality_history(self) -> List[float]:
-        return self._ema.history()
+_default_generator = LanguageGeneration()
 
 
-EMOJI_PATTERN = re.compile(r"[\U0001F300-\U0001FAFF]")
+class NLGContext:
+    """Compatibility façade storing the evolving reply text."""
+
+    def __init__(self, base_text: str, apply_hint=None):
+        self.base_text = base_text or ""
+        self.text = self.base_text.strip()
+        self._apply_hint = apply_hint or (lambda text, hint: text)
+        self.actions: List[Dict[str, Any]] = []
+        self.sections: List[Dict[str, str]] = []
+        self.meta: Dict[str, Any] = {}
+        self.raw: MutableMapping[str, Any] = {}
+
+    def register_custom_action(self, origin: str, hint: str) -> None:
+        entry = {"origin": origin, "hint": hint}
+        if entry not in self.actions:
+            self.actions.append(entry)
+
+    def applied_hints(self) -> List[Dict[str, Any]]:
+        return list(self.actions)
+
+    def update_from_result(self, result: NLGResult) -> None:
+        self.text = result.message
+        self.sections = list(result.sections)
+        self.meta = dict(result.meta)
+        self.raw = dict(result.raw)
+        if result.applied_actions:
+            self.actions = [dict(item) for item in result.applied_actions]
 
 
-class OnlineFallbackClassifier:
-    """Light-weight online classifier using simple lexical features."""
-
-    def __init__(self, learning_rate: float = 0.25, max_step: float = 0.5) -> None:
-        self._weights: Dict[str, float] = defaultdict(float)
-        self._bias = -1.5
-        self._lr = learning_rate
-        self._max_step = max_step
-
-    def _features(self, token: str) -> Dict[str, float]:
-        base = token or ""
-        length = len(base)
-        vowel_ratio = sum(ch.lower() in "aeiouyàâäéèêëîïôöùûü" for ch in base) / length if length else 0.0
-        punct_ratio = sum(not ch.isalnum() for ch in base) / length if length else 0.0
-        upper_ratio = sum(ch.isupper() for ch in base) / length if length else 0.0
-        emoji_presence = 1.0 if EMOJI_PATTERN.search(base) else 0.0
-        features = {
-            "bias": 1.0,
-            "length": min(length, 12) / 12.0,
-            "vowel_ratio": vowel_ratio,
-            "punct_ratio": punct_ratio,
-            "upper_ratio": upper_ratio,
-            "emoji": emoji_presence,
-        }
-        for n in (2, 3):
-            for idx in range(max(0, length - n + 1)):
-                gram = base[idx : idx + n].lower()
-                features[f"ng:{n}:{gram}"] = 1.0
-        return features
-
-    def predict(self, token: str) -> float:
-        feats = self._features(token)
-        z = self._bias
-        for name, value in feats.items():
-            z += self._weights.get(name, 0.0) * value
-        return 1.0 / (1.0 + math.exp(-z))
-
-    def update(self, token: str, reward: float) -> None:
-        reward = min(max(reward, 0.0), 1.0)
-        prediction = self.predict(token)
-        error = reward - prediction
-        step = max(-self._max_step, min(self._max_step, self._lr * error))
-        feats = self._features(token)
-        for name, value in feats.items():
-            self._weights[name] += step * value
-        self._bias += step
-
-    def should_paraphrase(self, token: str, threshold: float = 0.65) -> bool:
-        return self.predict(token) >= threshold
+def generate_reply(request: NLGRequest, *, llm_manager=None) -> NLGResult:
+    if llm_manager is None:
+        generator = _default_generator
+    else:
+        generator = LanguageGeneration(llm_manager=llm_manager)
+    return generator.generate(request)
 
 
-GLOBAL_EXPLORER = BanditExplorer()
-GLOBAL_QUALITY_TRACKER = QualityTracker()
-GLOBAL_CLASSIFIER = OnlineFallbackClassifier()
+def apply_mai_bids_to_nlg(
+    nlg_context: NLGContext,
+    state: Optional[Mapping[str, Any]],
+    predicate_registry: Optional[Mapping[str, Any]],
+    *,
+    contract: Optional[Mapping[str, Any]] = None,
+    reasoning: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+    llm_manager=None,
+) -> NLGResult:
+    """Generate the final reply via the LLM and update ``nlg_context``."""
+
+    state = state or {}
+    request = NLGRequest(
+        base_text=nlg_context.text or nlg_context.base_text,
+        surface=nlg_context.base_text,
+        dialogue=state.get("dialogue"),
+        reasoning=reasoning,
+        contract=contract,
+        style=metadata.get("style") if metadata else None,
+        memory=state.get("memory"),
+        hints=nlg_context.applied_hints(),
+        metadata=metadata,
+    )
+    result = generate_reply(request, llm_manager=llm_manager)
+    nlg_context.update_from_result(result)
+    return result
 
 
 def paraphrase_light(
     text: str,
-    prob: float = 0.35,
     *,
-    explorer: Optional[BanditExplorer] = None,
-    quality_tracker: Optional[QualityTracker] = None,
-    classifier: Optional[OnlineFallbackClassifier] = None,
-    rng: Optional[random.Random] = None,
+    tone: Optional[str] = None,
+    hints: Optional[Sequence[Mapping[str, Any]]] = None,
+    llm_manager=None,
 ) -> str:
-    if not text:
-        return ""
+    """Return a lightly paraphrased text produced by the LLM contract."""
 
-    explorer = explorer or GLOBAL_EXPLORER
-    quality_tracker = quality_tracker or GLOBAL_QUALITY_TRACKER
-    classifier = classifier or GLOBAL_CLASSIFIER
-    rng = rng or random.Random()
+    metadata: Dict[str, Any] = {"variant": "light_paraphrase"}
+    if tone:
+        metadata["tone"] = tone
+    request = NLGRequest(
+        base_text=text,
+        mode="paraphrase",
+        hints=hints or (),
+        metadata=metadata,
+    )
+    result = generate_reply(request, llm_manager=llm_manager)
+    return result.message
 
-    tokens = re.split(r"(\s+)", text)
-    rebuilt: List[str] = []
 
-    for token in tokens:
-        if not token or token.isspace():
-            rebuilt.append(token)
-            continue
+def join_tokens(tokens: Iterable[str]) -> str:
+    """Minimal token join helper kept for backwards compatibility."""
 
-        prefix, core, suffix = _strip_punct(token)
-        if not core:
-            rebuilt.append(token)
-            continue
-
-        inner_prefix = ""
-        core_body = core
-        apostrophe_match = re.match(r"^([A-Za-zÀ-ÖØ-öø-ÿ]{1,3}['’])(.*)$", core_body)
-        if apostrophe_match:
-            inner_prefix = apostrophe_match.group(1)
-            core_body = apostrophe_match.group(2)
-
-        if not core_body:
-            rebuilt.append(token)
-            continue
-
-        normalized = _normalize(core_body)
-        synonyms = DEFAULT_PARAPHRASES.get(normalized)
-        fallback_synonyms = FALLBACK_PARAPHRASES.get(normalized)
-        selected: Optional[str] = None
-
-        if synonyms:
-            if rng.random() < prob:
-                choice = explorer.select(normalized, synonyms)
-                if choice:
-                    selected = choice
-        elif fallback_synonyms and classifier.should_paraphrase(core_body):
-            choice = explorer.select(f"fallback:{normalized}", fallback_synonyms)
-            if choice:
-                selected = choice
-
-        if selected:
-            replaced = _restore_casing(core_body, selected)
-            rebuilt_token = _rebuild_token(prefix + inner_prefix, replaced, suffix)
-            reward = quality_tracker.observe(core_body, replaced)
-            key = normalized if synonyms else f"fallback:{normalized}"
-            explorer.update(key, selected, reward)
-            classifier.update(core_body, reward)
-            rebuilt.append(rebuilt_token)
-            logger.debug(
-                "Paraphrase applied: '%s' -> '%s' (reward=%.3f)",
-                core_body,
-                replaced,
-                reward,
-            )
-        else:
-            if EST_VARIANT_PATTERN.search(token):
-                logger.debug("Pattern 'est …' detected, no safe paraphrase applied for '%s'", token)
-            rebuilt.append(token)
-
-    output = "".join(rebuilt)
-    output = re.sub(r"\s+\n", "\n", output)
-    return output.strip()
+    return " ".join(str(tok) for tok in tokens if tok is not None).replace("  ", " ").strip()

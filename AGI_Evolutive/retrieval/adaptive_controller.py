@@ -1,356 +1,276 @@
-import json
-import logging
-import os
-import random
-import time
-from collections import deque
-from copy import deepcopy
-from typing import Any, Deque, Dict, Iterable, List, Optional
+"""LLM-first retrieval orchestration controller."""
 
-from AGI_Evolutive.cognition.meta_cognition import OnlineLinear
-from AGI_Evolutive.utils.llm_service import try_call_llm_dict
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+
+from AGI_Evolutive.utils.llm_service import LLMIntegrationError, get_llm_manager
 
 
-logger = logging.getLogger(__name__)
+class RAGOrchestrationError(RuntimeError):
+    """Raised when the retrieval orchestration payload is invalid."""
 
 
-def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, float(value)))
+def _coerce_string(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
 
 
-class DiscreteThompsonSampler:
-    """Lightweight Thompson Sampling helper persisted as a dict."""
-
-    def __init__(self, options: Iterable[float], state: Optional[Dict[str, Any]] = None):
-        self.options: List[float] = list(dict.fromkeys(float(o) for o in options))
-        if not self.options:
-            raise ValueError("DiscreteThompsonSampler requires at least one option")
-        self.state: Dict[str, Any] = state if isinstance(state, dict) else {}
-        self.state.setdefault("_meta", {})
-        for opt in self.options:
-            key = self._key(opt)
-            self.state.setdefault(key, {"alpha": 1.0, "beta": 1.0})
-        last = self.state["_meta"].get("last_choice")
-        if last is not None and last not in self.options:
-            last = None
-        self._last_choice: Optional[float] = float(last) if last is not None else None
-
-    @staticmethod
-    def _key(value: float) -> str:
-        return f"{float(value):.6f}"
-
-    def ensure_choice(self, default: float) -> float:
-        if self._last_choice is None:
-            return self.sample(default)
-        return float(self._last_choice)
-
-    def sample(self, default: float) -> float:
-        best_choice: Optional[float] = None
-        best_draw = -1.0
-        for opt in self.options:
-            entry = self.state[self._key(opt)]
-            draw = random.betavariate(float(entry.get("alpha", 1.0)), float(entry.get("beta", 1.0)))
-            if draw > best_draw:
-                best_draw = draw
-                best_choice = opt
-        if best_choice is None:
-            best_choice = float(default)
-        self._mark_choice(best_choice)
-        return float(best_choice)
-
-    def update(self, reward: float) -> None:
-        if self._last_choice is None:
-            return
-        key = self._key(self._last_choice)
-        entry = self.state.setdefault(key, {"alpha": 1.0, "beta": 1.0})
-        reward = _clamp(reward)
-        entry["alpha"] = float(entry.get("alpha", 1.0)) + reward
-        entry["beta"] = float(entry.get("beta", 1.0)) + (1.0 - reward)
-
-    def _mark_choice(self, choice: float) -> None:
-        self._last_choice = float(choice)
-        self.state.setdefault("_meta", {})["last_choice"] = float(choice)
-
-    def to_state(self) -> Dict[str, Any]:
-        return deepcopy(self.state)
+def _coerce_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    result: List[str] = []
+    if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+        for item in value:
+            if isinstance(item, str):
+                cleaned = item.strip()
+                if cleaned:
+                    result.append(cleaned)
+    return result
 
 
-class AdaptiveEMA:
-    """EMA whose decay factor is chosen adaptively via Thompson Sampling."""
+def _coerce_mapping(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(key): val for key, val in value.items()}
 
-    def __init__(self, sampler: DiscreteThompsonSampler, default_beta: float = 0.6, initial: float = 0.5):
-        self.sampler = sampler
-        self.default_beta = float(default_beta)
-        self.value = float(initial)
-        self._last_beta: Optional[float] = None
 
-    def update(self, signal: float) -> float:
-        beta = self.sampler.ensure_choice(self.default_beta)
-        beta = _clamp(beta, 0.05, 0.95)
-        self.value = beta * self.value + (1.0 - beta) * float(signal)
-        self._last_beta = beta
-        return self.value
+def _coerce_actions(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, Iterable) or isinstance(value, (bytes, bytearray, str)):
+        return []
+    actions: List[Dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            actions.append({str(key): val for key, val in item.items()})
+    return actions
 
-    def reinforce(self, reward: float) -> None:
-        if self._last_beta is None:
-            return
-        self.sampler.update(_clamp(reward))
-        self._last_beta = None
+
+def _merge_nested(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {str(key): val for key, val in base.items()}
+    for key, value in overrides.items():
+        key_str = str(key)
+        if isinstance(value, Mapping) and isinstance(merged.get(key_str), Mapping):
+            merged[key_str] = _merge_nested(merged[key_str], value)  # type: ignore[arg-type]
+        else:
+            merged[key_str] = value
+    return merged
+
+
+@dataclass
+class RAGPlanRequest:
+    """Structured payload forwarded to the orchestration LLM."""
+
+    question: str
+    config: Mapping[str, Any]
+    history: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
+    memory: Optional[Mapping[str, Any]] = None
+    diagnostics: Optional[Mapping[str, Any]] = None
+    metadata: Optional[Mapping[str, Any]] = None
+    mode: str = "plan"
+
+    def build_payload(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "mode": self.mode,
+            "question": self.question,
+            "config": _coerce_mapping(self.config),
+        }
+        if self.history:
+            payload["history"] = [
+                _coerce_mapping(item) for item in self.history if isinstance(item, Mapping)
+            ]
+        if self.memory:
+            payload["memory"] = _coerce_mapping(self.memory)
+        if self.diagnostics:
+            payload["diagnostics"] = _coerce_mapping(self.diagnostics)
+        if self.metadata:
+            payload["metadata"] = _coerce_mapping(self.metadata)
+        return payload
+
+
+@dataclass
+class RAGPlan:
+    """Normalised representation of the LLM plan response."""
+
+    question: str
+    plan_id: Optional[str]
+    expansions: List[str]
+    overrides: Dict[str, Any]
+    actions: List[Dict[str, Any]]
+    decision: Optional[str]
+    notes: List[str]
+    meta: Dict[str, Any]
+    raw: MutableMapping[str, Any]
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any], *, question: str) -> "RAGPlan":
+        if not isinstance(payload, Mapping):
+            raise RAGOrchestrationError("LLM payload must be a mapping")
+
+        plan_id = _coerce_string(payload.get("plan_id"))
+        expansions = _coerce_string_list(
+            payload.get("expansions") or payload.get("queries") or payload.get("supplemental_queries")
+        )
+        overrides = _coerce_mapping(payload.get("overrides"))
+        actions = _coerce_actions(payload.get("actions"))
+        decision = _coerce_string(payload.get("decision"))
+        notes = _coerce_string_list(payload.get("notes"))
+        meta = _coerce_mapping(payload.get("meta"))
+
+        raw: MutableMapping[str, Any] = dict(payload)
+        if expansions and "expansions" not in raw:
+            raw["expansions"] = list(expansions)
+        if overrides and "overrides" not in raw:
+            raw["overrides"] = dict(overrides)
+
+        return cls(
+            question=question,
+            plan_id=plan_id,
+            expansions=expansions,
+            overrides=overrides,
+            actions=actions,
+            decision=decision,
+            notes=notes,
+            meta=meta,
+            raw=raw,
+        )
+
+    def merged_config(self, base_config: Mapping[str, Any]) -> Dict[str, Any]:
+        if not self.overrides:
+            return {str(key): val for key, val in base_config.items()}
+        return _merge_nested(base_config, self.overrides)
+
+    def to_context(self) -> Dict[str, Any]:
+        context: Dict[str, Any] = {
+            "question": self.question,
+            "plan": {
+                "plan_id": self.plan_id,
+                "expansions": list(self.expansions),
+                "decision": self.decision,
+                "actions": [dict(action) for action in self.actions],
+            },
+            "overrides": dict(self.overrides),
+            "notes": list(self.notes),
+            "meta": dict(self.meta),
+            "raw": dict(self.raw),
+        }
+        return context
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.to_context()
 
 
 class RAGAdaptiveController:
-    """Learned controller for RAG hyper-parameters with lightweight persistence."""
+    """Thin façade delegating the full retrieval orchestration to the LLM."""
 
-    def __init__(
-        self,
-        base_config: Dict[str, Any],
-        state_path: str = "data/rag/adaptive_state.json",
-    ) -> None:
-        self.base_config = deepcopy(base_config)
-        self.state_path = state_path
-        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
-        self.state = self._load_state()
-        weight_state = self.state.get("weight_model")
-        self.weight_model = OnlineLinear.from_state(
-            weight_state,
-            bounds=(0.05, 0.95),
-            lr=0.04,
-            l2=0.002,
-            max_grad=0.25,
-            warmup=18,
-            init_weight=0.4,
-        )
-        threshold_state = self.state.get("threshold_model")
-        self.threshold_model = OnlineLinear.from_state(
-            threshold_state,
-            bounds=(0.1, 0.9),
-            lr=0.03,
-            l2=0.001,
-            max_grad=0.2,
-            warmup=20,
-            init_weight=0.2,
-        )
-        half_life_state = self.state.get("half_life_bandit")
-        support_state = self.state.get("support_bandit")
-        top1_state = self.state.get("top1_bandit")
-        beta_state = self.state.get("ema_bandit")
+    def __init__(self, base_config: Mapping[str, Any], *, llm_manager=None) -> None:
+        self.base_config: Dict[str, Any] = _coerce_mapping(base_config)
+        self._manager = llm_manager or get_llm_manager()
+        self.last_request: Optional[RAGPlanRequest] = None
+        self.last_plan: Optional[RAGPlan] = None
+        self.last_feedback: Optional[Dict[str, Any]] = None
+        self.last_activation: Optional[float] = None
 
-        self.half_life_sampler = DiscreteThompsonSampler((3, 7, 14, 30), half_life_state)
-        self.support_sampler = DiscreteThompsonSampler((0.12, 0.15, 0.18, 0.2), support_state)
-        self.top1_sampler = DiscreteThompsonSampler((0.18, 0.22, 0.25, 0.28), top1_state)
-        self.activation_sampler = DiscreteThompsonSampler((0.2, 0.4, 0.6, 0.8), beta_state)
-
-        self.global_activation_tracker = AdaptiveEMA(self.activation_sampler, default_beta=0.6, initial=0.5)
-        self.pending_interactions: Deque[Dict[str, Any]] = deque(maxlen=32)
-        self.last_config: Dict[str, Any] = self._make_config({}, {})
-        self._dirty = False
-
-    def _load_state(self) -> Dict[str, Any]:
-        if not os.path.exists(self.state_path):
-            return {}
+    def _call_orchestrator(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
         try:
-            with open(self.state_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    def _save_state(self) -> None:
-        if not self._dirty:
-            return
-        try:
-            with open(self.state_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "weight_model": self.weight_model.to_state(),
-                        "threshold_model": self.threshold_model.to_state(),
-                        "half_life_bandit": self.half_life_sampler.to_state(),
-                        "support_bandit": self.support_sampler.to_state(),
-                        "top1_bandit": self.top1_sampler.to_state(),
-                        "ema_bandit": self.activation_sampler.to_state(),
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            self._dirty = False
-        except Exception:
-            pass
-
-    def _make_config(self, retrieval_overrides: Dict[str, float], guard_overrides: Dict[str, float]) -> Dict[str, Any]:
-        cfg = deepcopy(self.base_config)
-        retr = cfg.setdefault("retrieval", {})
-        retr.update(retrieval_overrides)
-        guards = cfg.setdefault("guards", {})
-        guards.update(guard_overrides)
-        retr.setdefault("recency_half_life_days", float(self.base_config.get("retrieval", {}).get("recency_half_life_days", 14.0)))
-        return cfg
-
-    def prepare_query(self, question: str) -> Dict[str, Any]:
-        norm_len = _clamp(len(question) / 256.0)
-        token_count = len(question.split())
-        punctuation = sum(1 for c in question if c in {"?", "!"})
-        features = {
-            "bias": 1.0,
-            "len_norm": norm_len,
-            "token_norm": _clamp(token_count / 80.0),
-            "punctuation": _clamp(punctuation / 3.0),
-            "digits": _clamp(sum(ch.isdigit() for ch in question) / max(1.0, len(question))),
-        }
-        alpha_dense = _clamp(self.weight_model.predict(features), 0.05, 0.95)
-        beta_sparse = _clamp(1.0 - alpha_dense, 0.05, 0.95)
-
-        threshold_features = {
-            "bias": 1.0,
-            "len_norm": norm_len,
-            "tokens": _clamp(token_count / 60.0),
-        }
-        min_support = _clamp(self.threshold_model.predict(threshold_features), 0.05, 0.6)
-
-        detail_level: Optional[str] = None
-        llm_analysis: Optional[Dict[str, Any]] = None
-        if question.strip():
-            try:
-                llm_analysis = try_call_llm_dict(
-                    "rag_adaptive_controller",
-                    input_payload={
-                        "question": question,
-                        "features": features,
-                        "threshold_features": threshold_features,
-                        "defaults": {
-                            "alpha_dense": alpha_dense,
-                            "beta_sparse": beta_sparse,
-                            "min_support": min_support,
-                            "activation": getattr(self.global_activation_tracker, "value", 0.5),
-                        },
-                    },
-                    logger=logger,
-                )
-            except Exception:
-                llm_analysis = None
-        if llm_analysis:
-            weights = llm_analysis.get("weights")
-            if isinstance(weights, dict):
-                dense = weights.get("dense")
-                sparse = weights.get("sparse")
-                try:
-                    if dense is not None:
-                        alpha_dense = _clamp(float(dense), 0.05, 0.95)
-                    if sparse is not None:
-                        beta_sparse = _clamp(float(sparse), 0.05, 0.95)
-                    if dense is None and sparse is not None:
-                        alpha_dense = _clamp(1.0 - beta_sparse, 0.05, 0.95)
-                    elif sparse is None and dense is not None:
-                        beta_sparse = _clamp(1.0 - alpha_dense, 0.05, 0.95)
-                except (TypeError, ValueError):
-                    logger.debug("LLM rag weights invalid: %r", weights)
-            detail = llm_analysis.get("detail_level")
-            if isinstance(detail, str) and detail.strip():
-                detail_level = detail.strip().lower()
-
-        half_life = float(
-            self.half_life_sampler.ensure_choice(
-                self.base_config.get("retrieval", {}).get("recency_half_life_days", 14.0)
+            response = self._manager.call_dict(
+                "retrieval_orchestrator",
+                input_payload=dict(payload),
             )
+        except LLMIntegrationError as exc:  # pragma: no cover - passthrough
+            raise RAGOrchestrationError(str(exc)) from exc
+        if not isinstance(response, Mapping):
+            raise RAGOrchestrationError("LLM returned no payload")
+        return {str(key): value for key, value in response.items()}
+
+    def prepare_query(
+        self,
+        question: str,
+        *,
+        history: Sequence[Mapping[str, Any]] = (),
+        memory: Optional[Mapping[str, Any]] = None,
+        diagnostics: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        request = RAGPlanRequest(
+            question=question,
+            config=self.base_config,
+            history=history,
+            memory=memory,
+            diagnostics=diagnostics,
+            metadata=metadata,
         )
-        min_support_score = float(self.support_sampler.ensure_choice(min_support))
-        min_top1_score = float(self.top1_sampler.ensure_choice(0.25))
+        self.last_request = request
+        payload = request.build_payload()
+        response = self._call_orchestrator(payload)
+        plan = RAGPlan.from_payload(response, question=question)
+        self.last_plan = plan
+        merged = plan.merged_config(self.base_config)
+        self.base_config = merged
+        return plan.to_context()
 
-        if detail_level:
-            if detail_level in {"technique", "haut", "detaillé", "detaillé"}:
-                min_support_score = _clamp(max(min_support_score, min_support + 0.05), 0.05, 0.95)
-                min_top1_score = _clamp(min_top1_score + 0.05, 0.05, 0.95)
-            elif detail_level in {"synthese", "bas", "résumé", "resume"}:
-                min_support_score = _clamp(min_support_score * 0.85, 0.05, 0.95)
-                min_top1_score = _clamp(min_top1_score * 0.9, 0.05, 0.95)
-
-        retrieval_overrides = {
-            "alpha_dense": alpha_dense,
-            "beta_sparse": beta_sparse,
-            "recency_half_life_days": half_life,
+    def observe_outcome(
+        self,
+        context: Mapping[str, Any],
+        rag_output: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        payload = {
+            "mode": "feedback",
+            "plan": dict(context),
+            "rag_output": _coerce_mapping(rag_output),
         }
-        guard_overrides = {
-            "min_support_score": min_support_score,
-            "min_top1_score": min_top1_score,
-        }
-        cfg = self._make_config(retrieval_overrides, guard_overrides)
-        self.last_config = deepcopy(cfg)
-        context = {
-            "timestamp": time.time(),
-            "features": features,
-            "threshold_features": threshold_features,
-            "alpha_dense": alpha_dense,
-            "beta_sparse": beta_sparse,
-            "min_support_score": min_support_score,
-            "min_top1_score": min_top1_score,
-            "recency_half_life_days": half_life,
-            "config": cfg,
-        }
-        if detail_level:
-            context["llm_detail_level"] = detail_level
-        if llm_analysis and llm_analysis.get("justification"):
-            context["llm_justification"] = str(llm_analysis["justification"])
-        return context
+        response = self._call_orchestrator(payload)
+        self.last_feedback = response
+        return response
 
-    def observe_outcome(self, context: Dict[str, Any], rag_out: Dict[str, Any]) -> None:
-        diagnostics = rag_out.get("diagnostics", {}) if isinstance(rag_out, dict) else {}
-        citations = rag_out.get("citations") or []
-        top_scores = diagnostics.get("top_scores") or []
-        top1 = float(top_scores[0]) if top_scores else 0.0
-        coverage = _clamp(len(citations) / float(diagnostics.get("fused_hits", max(1, len(citations)))))
-        status = rag_out.get("status")
-        auto_reward = 0.1
-        if status == "ok":
-            auto_reward = 0.4 + 0.4 * _clamp(top1)
-            auto_reward += 0.2 * coverage
-        elif status == "refused":
-            auto_reward = 0.05
-        interaction = {
-            "context": context,
-            "rag_out": rag_out,
-            "diagnostics": diagnostics,
-            "auto_reward": _clamp(auto_reward),
-            "pending": True,
+    def apply_feedback(self, reward: float, metadata: Optional[Mapping[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        payload = {
+            "mode": "reward",
+            "reward": float(reward),
         }
-        self.pending_interactions.append(interaction)
-        self._apply_online_updates(context, auto_reward)
-        self._dirty = True
-        self._save_state()
-
-    def _apply_online_updates(self, context: Dict[str, Any], reward: float) -> None:
-        reward = _clamp(reward)
-        self.weight_model.update(context.get("features", {}), reward)
-        self.threshold_model.update(context.get("threshold_features", {}), reward)
-        self.half_life_sampler.update(reward)
-        self.support_sampler.update(reward)
-        self.top1_sampler.update(reward)
-
-    def apply_feedback(self, reward: float, horizon: float = 45.0) -> None:
-        if not self.pending_interactions:
-            return
-        now = time.time()
-        reward = _clamp(reward)
-        for interaction in reversed(self.pending_interactions):
-            context = interaction.get("context", {})
-            ts = float(context.get("timestamp", 0.0))
-            if not interaction.get("pending"):
-                continue
-            if now - ts > horizon:
-                interaction["pending"] = False
-                continue
-            combined = 0.6 * float(interaction.get("auto_reward", 0.3)) + 0.4 * reward
-            self._apply_online_updates(context, combined)
-            interaction["pending"] = False
-            self._dirty = True
-            break
-        self._save_state()
+        if metadata:
+            payload["metadata"] = _coerce_mapping(metadata)
+        response = self._call_orchestrator(payload)
+        self.last_feedback = response
+        return response
 
     def current_config(self) -> Dict[str, Any]:
-        return deepcopy(self.last_config)
+        return dict(self.base_config)
 
-    def update_global_activation(self, signal: float, reinforce: Optional[float] = None) -> float:
-        value = self.global_activation_tracker.update(signal)
+    def update_global_activation(
+        self,
+        signal: float,
+        *,
+        reinforce: Optional[float] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> float:
+        payload: Dict[str, Any] = {
+            "mode": "activation",
+            "signal": float(signal),
+        }
         if reinforce is not None:
-            self.global_activation_tracker.reinforce(reinforce)
-            self._dirty = True
-            self._save_state()
-        return value
+            payload["reinforce"] = float(reinforce)
+        if metadata:
+            payload["metadata"] = _coerce_mapping(metadata)
+        response = self._call_orchestrator(payload)
+        value = response.get("activation")
+        try:
+            activation = float(value)
+        except (TypeError, ValueError):
+            activation = float(signal)
+        activation = max(0.0, min(1.0, activation))
+        self.last_activation = activation
+        return activation
+
+
+__all__ = [
+    "RAGAdaptiveController",
+    "RAGPlan",
+    "RAGPlanRequest",
+    "RAGOrchestrationError",
+]

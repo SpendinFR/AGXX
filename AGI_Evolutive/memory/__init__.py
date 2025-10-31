@@ -92,11 +92,8 @@ except Exception:  # pragma: no cover
 
 from .adaptive import AdaptiveMemoryParameters, ThompsonBetaScheduler
 from .retrieval import MemoryRetrieval
-from .semantic_memory_manager import (
-    SemanticMemoryManager as _SummarizationCoordinator,
-    ProgressiveSummarizer,
-    SummarizerConfig,
-)
+from .summarizer import ProgressiveSummarizer, SummarizerConfig
+from .semantic_memory_manager import SemanticMemoryManager as _SummarizationCoordinator
 from .semantic_manager import SemanticMemoryManager as _ConceptMemoryManager
 from .alltime import LongTermMemoryHub
 from AGI_Evolutive.utils.llm_service import try_call_llm_dict

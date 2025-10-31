@@ -140,28 +140,87 @@ def _sanitize_identity_mission(payload: Mapping[str, Any]) -> Dict[str, Any]:
     mission_block = payload.get("mission")
     if not isinstance(mission_block, Mapping):
         mission_block = {}
-    axes: Dict[str, str] = {}
-    axis_aliases = {
-        "prioritaire": ("prioritaire", "priority", "focus"),
-        "support": ("support", "backbone", "soutien"),
-        "vision": ("vision", "aspiration", "north_star"),
-    }
-    for axis, aliases in axis_aliases.items():
-        value = ""
-        for alias in aliases:
-            value = _as_text(mission_block.get(alias) or payload.get(alias))
-            if value:
-                break
-        if value:
-            axes[axis] = value
 
-    cleaned: Dict[str, Any] = {"mission": axes}
+    mission: Dict[str, str] = {}
+    for key, value in mission_block.items():
+        if not isinstance(key, str):
+            continue
+        text = _as_text(value)
+        if text:
+            mission[key] = text
+
+    cleaned: Dict[str, Any] = {"mission": mission}
+
     mission_text = _as_text(payload.get("mission_text") or payload.get("mission_statement"))
     if mission_text:
         cleaned["mission_text"] = mission_text
-    notes = _as_text(payload.get("notes"))
-    if notes:
-        cleaned["notes"] = notes
+
+    priorities: list[Dict[str, Any]] = []
+    for raw in _iter_sequence(payload.get("priorities")):
+        if not isinstance(raw, Mapping):
+            continue
+        entry: Dict[str, Any] = {}
+        label = _as_text(raw.get("label") or raw.get("name") or raw.get("focus"))
+        if label:
+            entry["label"] = label
+        horizon = _as_text(raw.get("horizon") or raw.get("timeline"))
+        if horizon:
+            entry["horizon"] = horizon
+        rationale = _as_text(raw.get("rationale") or raw.get("reason"))
+        if rationale:
+            entry["rationale"] = rationale
+        if entry:
+            priorities.append(entry)
+        if len(priorities) >= 8:
+            break
+    if priorities:
+        cleaned["priorities"] = priorities
+
+    follow_up: list[Dict[str, Any]] = []
+    for raw in _iter_sequence(payload.get("follow_up")):
+        if not isinstance(raw, Mapping):
+            continue
+        entry: Dict[str, Any] = {}
+        action_type = _as_text(raw.get("type") or raw.get("kind"))
+        if action_type:
+            entry["type"] = action_type
+        summary = _as_text(raw.get("summary") or raw.get("description"))
+        if summary:
+            entry["summary"] = summary
+        deadline = _as_text(raw.get("deadline") or raw.get("due"))
+        if deadline:
+            entry["deadline"] = deadline
+        if entry:
+            follow_up.append(entry)
+        if len(follow_up) >= 8:
+            break
+    if follow_up:
+        cleaned["follow_up"] = follow_up
+
+    notes_entries: list[str] = []
+    raw_notes = payload.get("notes")
+    if isinstance(raw_notes, str):
+        text = _as_text(raw_notes)
+        if text:
+            notes_entries.append(text)
+    else:
+        for entry in _iter_sequence(raw_notes):
+            text = _as_text(entry)
+            if text:
+                notes_entries.append(text)
+            if len(notes_entries) >= 8:
+                break
+    if notes_entries:
+        cleaned["notes"] = notes_entries
+
+    if isinstance(payload.get("telemetry"), Mapping):
+        telemetry: Dict[str, Any] = {}
+        for key, value in payload["telemetry"].items():
+            if isinstance(key, str):
+                telemetry[key] = value
+        if telemetry:
+            cleaned["telemetry"] = telemetry
+
     return cleaned
 
 

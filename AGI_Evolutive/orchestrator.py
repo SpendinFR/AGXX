@@ -2466,26 +2466,41 @@ class Orchestrator:
         self._mission_tick = getattr(self, "_mission_tick", 0) + 1
         if self._mission_tick % 5 == 0:
             try:
-                res = recommend_and_apply_mission(self, threshold=0.75, delta_gate=0.10)
-                if res.get("status") == "needs_confirmation":
-                    proposal = {
-                        "kind": "mission_proposal",
-                        "best": res.get("best"),
-                        "second": res.get("second"),
-                        "delta": res.get("delta"),
-                        "ts": time.time(),
-                    }
-                    try:
-                        self._sj_new_items_queue.append(proposal)
-                    except Exception:
-                        pass
-                    if hasattr(self.memory, "store") and hasattr(self.memory.store, "add"):
+                directive = recommend_and_apply_mission(self, threshold=0.75, delta_gate=0.10)
+                follow_up = getattr(directive, "follow_up", []) or []
+                for action in follow_up:
+                    if not isinstance(action, dict):
+                        continue
+                    action_type = action.get("type") or action.get("kind")
+                    if action_type == "request_confirmation":
+                        proposal = {
+                            "kind": "mission_proposal",
+                            "action": action,
+                            "ts": time.time(),
+                        }
                         try:
-                            payload = dict(proposal)
-                            payload["status"] = "needs_confirmation"
-                            self.memory.store.add(payload)
+                            self._sj_new_items_queue.append(proposal)
                         except Exception:
                             pass
+                        if hasattr(self.memory, "store") and hasattr(self.memory.store, "add"):
+                            try:
+                                payload = dict(proposal)
+                                payload["status"] = "needs_confirmation"
+                                payload["notes"] = list(getattr(directive, "notes", ()))
+                                self.memory.store.add(payload)
+                            except Exception:
+                                pass
+                mission_record = {
+                    "kind": "mission_update",
+                    "mission": dict(getattr(directive, "mission", {})),
+                    "statement": getattr(directive, "statement", None),
+                    "ts": time.time(),
+                }
+                if hasattr(self.memory, "store") and hasattr(self.memory.store, "add"):
+                    try:
+                        self.memory.store.add(mission_record)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
